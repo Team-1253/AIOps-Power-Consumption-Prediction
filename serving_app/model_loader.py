@@ -1,16 +1,19 @@
 """
 로컬 .pt 번들 / MLflow Production 모델 로드 (Lazy vs Eager 선택).
 
-템플릿의 Keras 로더를 PyTorch 규격으로 교체. 동작 계약은 동일하다:
+■ 이 파일이 하는 일 (한 줄 요약)
+   서버가 예측에 쓸 모델을 "어디서, 언제" 불러올지 정하고, 예측 한 건을 수행합니다.
+   다른 파일(predict.py, health.py)은 get_model() 만 부르면 되고, 모델이 어디서 왔는지 몰라도 됩니다.
+
 - MODEL_SOURCE=local(기본) → serving_app/models/energy_lstm.pt 번들 로드
 - MODEL_SOURCE=mlflow → Registry Production 버전 로드, 스케일러는 번들 내장분 사용
-  (템플릿은 scaler.pkl 별도 파일이었으나, torch판은 번들에 스케일러를 동봉해
-  가중치-스케일러 불일치를 원천 차단한다)
+  (번들에 스케일러를 동봉해 가중치-스케일러 불일치를 원천 차단한다)
 
-입력 형식: [{"energy_relative_pct":.., "humi_pct":.., "temp_F":..}, ...] SEQ_LEN개
-(오래된 시각 → 최근 시각), raw 스케일. 서빙 요청 dict → 이 형식 변환은
-schemas.py / routers (서빙 담당) 영역.
-출력: 모델 raw 스칼라 1개 (변화율. kWh 역변환은 서빙팀 영역).
+■ API(kWh) ↔ 모델(변화율) 변환은 predict_one 이 맡는다
+   입력 : [{"energy_kwh":.., "humi_pct":.., "temp_F":..}, ...] seq_len+1개 (오래된 시각 → 최근 시각)
+   모델 : 시점별 [temp_F, humi_pct, energy_relative_pct] seq_len개 → 다음 1시간 변화율(%)
+   출력 : 다음 1시간 energy_kwh 예측값 (kWh)
+   변화율 seq_len개를 만들려면 직전 값이 하나 더 필요해서 입력이 seq_len+1개다.
 
 환경변수
     LOADING_MODE = lazy(기본값) | eager
@@ -43,27 +46,29 @@ class LoadedModel:
         self.seq_len = seq_len
         self.n_features = n_features
 
-    def predict_one(self, sequence) -> float:
+    def predict_one(self, sequence: list[dict]) -> float:
         """
-        sequence: 서빙이 넘기는 SEQ_LEN개 행.dict 형식
-            [{"energy_relative_pct":.., "humi_pct":.., "temp_F":..}, ...] 또는
-            [[temp, humi, energy], ...] — 오래된 시각 -> 최근 시각 순서.
-            (seq_len은 번들 input_shape 기준. 윈도우 변경 시 번들 재생성만으로 대응)
-        반환: 모델 raw 출력 1개 (변화율. kWh 역변환은 서빙팀 영역).
+        최근 seq_len+1시간 데이터로 다음 1시간 전력 사용량 1개를 예측합니다.
+        받는 것  : sequence = [{"energy_kwh": 2750.0, "humi_pct": 41.0, "temp_F": 58.0}, ... 25개]  (오래된 시간 → 최근 시간)
+        돌려줄 것: 다음 1시간 예상 사용량 (kWh 단위, 예: 2761.4)
         """
-        triples = []
-        for p in sequence:
-            if isinstance(p, dict):
-                triples.append([p["temp_F"], p["humi_pct"], p["energy_relative_pct"]])
-            else:
-                triples.append(list(p))
-        x = np.array(triples, dtype=np.float32).reshape(1, self.seq_len, self.n_features)
+        # ① kWh → 직전 시간 대비 변화율(%) — data/features.py 의 _relative_series 와 같은 식
+        energy = np.array([p["energy_kwh"] for p in sequence], dtype=float)
+        relative = 100.0 * (energy[1:] - energy[:-1]) / energy[:-1]
+
+        # ② 모델 입력 (1, seq_len, 3) — 시점별 [temp_F, humi_pct, energy_relative_pct]. 맨 앞 1시간은 변화율 계산에만 쓴다
+        x = np.array(
+            [[p["temp_F"], p["humi_pct"], r] for p, r in zip(sequence[1:], relative)], dtype=np.float32
+        ).reshape(1, self.seq_len, self.n_features)
         xs = self.scaler.transform_X(x)
+
+        # ③ 예측 → 표준화된 값을 변화율(%)로 되돌린다
         with torch.no_grad():
-            out = self._model(
-                torch.from_numpy(np.ascontiguousarray(xs)).to(DEVICE)
-            )
-        return float(out.cpu().numpy().ravel()[0])
+            out = self._model(torch.from_numpy(np.ascontiguousarray(xs)).to(DEVICE))
+        pred_relative = float(self.scaler.inverse_y(out.cpu().numpy())[0])
+
+        # ④ 변화율 → kWh: 마지막 시간 사용량에 예측 변화율을 적용한다
+        return float(energy[-1] * (1 + pred_relative / 100.0))
 
 
 class _BundleScaler:
@@ -131,7 +136,7 @@ def _load_model() -> LoadedModel:
 
 
 def load_eager() -> LoadedModel:
-    """Eager Loading: 서버 시작 시점에 즉시 모델을 로드한다."""
+    """Eager Loading: 서버가 켜질 때(main.py 의 startup) 바로 불러와 상자에 넣어 둡니다."""
     start = time.time()
     model = _load_model()
     print(f"[eager] model loaded in {time.time() - start:.3f}s at startup")
@@ -140,8 +145,14 @@ def load_eager() -> LoadedModel:
     return model
 
 
+def reset_cache():
+    """재학습으로 Production 이 바뀌었을 때 호출 — 다음 요청에서 새 모델을 다시 불러온다."""
+    global _model_cache
+    _model_cache = None
+
+
 def get_model() -> LoadedModel:
-    """Lazy Loading: 첫 요청이 들어올 때만 로드하고, 이후에는 캐시를 재사용한다."""
+    """Lazy Loading: 첫 요청이 들어올 때만 불러오고, 이후에는 상자(_model_cache)에 있는 것을 재사용합니다."""
     global _model_cache
     if _model_cache is None:
         start = time.time()

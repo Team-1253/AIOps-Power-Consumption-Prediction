@@ -4,7 +4,7 @@
 #       (수 GB대) - 빌드에 몇 분 걸릴 수 있습니다. (GPU 없는 컨테이너이지만 CPU로 정상 동작합니다)
 #
 # 포트: 컨테이너는 8099 에서 열립니다 -> 대시보드 http://localhost:8099/
-#       (로컬 uvicorn 실습 서버 8077 과 겹치지 않도록 분리)
+#       (로컬 uvicorn 서버 8077 과 겹치지 않도록 분리)
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -17,7 +17,7 @@ COPY serving_app/ serving_app/
 COPY data/ data/
 COPY scripts/ scripts/
 
-# 대시보드에서 업로드하는 것과 동일한 방식으로, 빌드용 샘플 데이터를 data/uploads/에
+# 대시보드에서 업로드하는 것과 동일한 방식으로, 빌드용 정제 데이터를 data/uploads/에
 # 먼저 "업로드"해 둔 뒤 -> Day2 MLflow 학습/등록까지 이미지 빌드 시점에 컨테이너 안에서
 # 전부 끝냅니다(로컬에서 미리 실행해둘 필요 없는 자기 완결형 이미지).
 # baseline .pt 번들(serving_app/models/energy_lstm.pt)은 repo에 포함되어 COPY로 들어갑니다.
@@ -27,7 +27,7 @@ COPY scripts/ scripts/
 # NOTE: train_and_register.py는 data/train.csv 등 split 파일을 읽으므로,
 # 데이터셋 담당이 빌드 컨텍스트에 split CSV를 포함시켜야 Day2 단계가 동작합니다.
 RUN mkdir -p data/uploads \
- && cp data/sample_haic_prices.csv data/uploads/build_seed.csv \
+ && cp data/hourly_clean.csv data/uploads/build_seed.csv \
  && python serving_app/train_and_register.py
 
 EXPOSE 8099

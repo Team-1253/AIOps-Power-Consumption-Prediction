@@ -17,11 +17,10 @@ from datetime import datetime
 
 from fastapi import APIRouter, Query
 
-from data.features import SEQ_LEN
 from data.storage import latest_upload, read_complete_rows
 from serving_app.monitoring import logger as request_logger
 from serving_app.monitoring.drift_detector import RMSE_THRESHOLD, WINDOW_SIZE
-from serving_app.schemas import TARGET_FIELD, TIME_FIELDS, HourlyPoint
+from serving_app.schemas import INPUT_LEN, TARGET_FIELD, TIME_FIELDS, HourlyPoint
 
 router = APIRouter(prefix="/system")
 
@@ -81,7 +80,7 @@ def info():
             feature_base[col] = round(sum(r[col] for r in recent) / len(recent), 3)
 
     return {
-        "seq_len": SEQ_LEN,
+        "seq_len": INPUT_LEN,  # 대시보드가 /predict 입력·배치 길이로 쓰는 값 (API 입력 길이)
         "features": FEATURES,
         "target": TARGET_FIELD,
         "feature_base": feature_base,

@@ -1,15 +1,5 @@
 """
 FastAPI 앱 진입점.
-
-Day1: app 생성, 라우터(predict, health) 등록, startup 이벤트에서 로딩 모드에 따라 모델 준비
-Day2: data 라우터 등록 (전력 데이터 CSV 업로드)
-Day3: "aiops" 로거를 logs/aiops.log 파일로 연결(로깅 설정) + logs 라우터(로그 파일 조회) 등록
-대시보드: 요청 로그 미들웨어(logs/requests.log) + system · models · metrics 조회 라우터 등록
-
-정적 대시보드: serving_app/static/index.html 이 /health · /predict · /predict/batch-test ·
-/data/upload · /logs · /system/* · /models/* · /metrics/summary 를 호출하는 운영 화면입니다.
-API 라우터를 먼저 등록한 뒤 StaticFiles를 "/"에 마지막으로 mount해야, /predict 같은 API 경로가 정적 파일보다
-먼저 매칭됩니다(Starlette는 등록 순서대로 라우트를 검사합니다).
 """
 import logging
 import os
@@ -51,7 +41,7 @@ app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="static")  # 
 
 @app.on_event("startup")
 def startup():
-    # Day1 실습 포인트: LOADING_MODE=eager 로 켜고 서버 시작 시간을 lazy와 비교해보세요.
+    # LOADING_MODE=eager 면 서버 시작 시 모델을 불러오고, lazy(기본)면 첫 /predict 요청 때 불러온다.
     if os.getenv("LOADING_MODE", "lazy") == "eager":
         model_loader.load_eager()
     else:

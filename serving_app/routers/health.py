@@ -1,4 +1,4 @@
-"""Day1: 헬스체크 엔드포인트."""
+"""헬스체크 엔드포인트."""
 from fastapi import APIRouter
 
 from serving_app import model_loader
