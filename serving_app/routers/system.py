@@ -36,7 +36,7 @@ _ALERT_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \[(\w+)\] 
 def _train_constants() -> dict:
     """train_and_register.py의 학습 상수를 읽는다.
 
-    모듈을 import하면 tensorflow·mlflow가 같이 올라와 조회 API가 느려지므로,
+    모듈을 import하면 torch·mlflow가 같이 올라와 조회 API가 느려지므로,
     소스 파일의 최상위 상수 대입문만 파싱한다.
     """
     names = {"RMSE_GATE", "MODEL_NAME", "BASE_EPOCHS", "FINE_TUNE_EPOCHS", "FINE_TUNE_LR"}
