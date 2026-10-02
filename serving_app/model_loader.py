@@ -66,6 +66,36 @@ class LoadedModel:
         return float(out.cpu().numpy().ravel()[0])
 
 
+class _BundleScaler:
+    """노트북 번들(feature_scaler/target_scaler 2개)을 학습 파이프라인의
+    단일 스케일러 인터페이스(transform_X/transform_y/inverse_y)로 감싼 어댑터.
+    데이터셋 담당의 정식 스케일러가 오면 교체한다."""
+
+    def __init__(self, feature_scaler, target_scaler):
+        self.feature_scaler = feature_scaler
+        self.target_scaler = target_scaler
+
+    def transform_X(self, a):
+        shape = a.shape
+        return self.feature_scaler.transform(a.reshape(-1, 3)).reshape(shape).astype(a.dtype)
+
+    def transform_y(self, y):
+        import numpy as _np
+
+        return self.target_scaler.transform(_np.asarray(y).reshape(-1, 1)).ravel()
+
+    def inverse_y(self, ys):
+        import numpy as _np
+
+        return self.target_scaler.inverse_transform(_np.asarray(ys).reshape(-1, 1)).ravel()
+
+
+def _scaler_from_bundle(bundle):
+    if "scaler" in bundle:
+        return bundle["scaler"]
+    return _BundleScaler(bundle["feature_scaler"], bundle["target_scaler"])
+
+
 def _load_bundle(path: str, version: str) -> LoadedModel:
     bundle = torch.load(path, map_location=DEVICE, weights_only=False)
     seq_len, n_features = bundle["input_shape"]
@@ -75,7 +105,7 @@ def _load_bundle(path: str, version: str) -> LoadedModel:
     )
     model.load_state_dict(bundle["model_state_dict"])
     return LoadedModel(
-        model=model, scaler=bundle["scaler"], version=version,
+        model=model, scaler=_scaler_from_bundle(bundle), version=version,
         seq_len=seq_len, n_features=n_features,
     )
 
@@ -90,7 +120,7 @@ def _load_from_mlflow() -> LoadedModel:
     model = mlflow_pytorch.load_model(MLFLOW_MODEL_URI)
     # 스케일러는 Registry가 아니라 로컬 번들에서 (가중치와 한 쌍으로 관리)
     bundle = torch.load(LOCAL_MODEL_PATH, map_location=DEVICE, weights_only=False)
-    return LoadedModel(model=model, scaler=bundle["scaler"], version="production")
+    return LoadedModel(model=model, scaler=_scaler_from_bundle(bundle), version="production")
 
 
 def _load_model() -> LoadedModel:
