@@ -32,6 +32,15 @@ uvicorn serving_app.main:app --host 0.0.0.0 --port 8077
 대시보드 `http://localhost:8077/`, API 문서 `http://localhost:8077/docs`.
 모델을 MLflow에서 불러올 때는 `MODEL_SOURCE=mlflow`, 서버 시작 시 바로 불러올 때는 `LOADING_MODE=eager`를 붙인다.
 
+모델 준비 (최초 1회, 대시보드에서 `data/hourly_clean.csv`를 업로드한 뒤):
+
+```bash
+python scripts/train_baseline_v1.py        # scaler.pkl, power_v1.keras 생성 (MODEL_SOURCE=local용)
+python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시 Production 승격
+```
+
+드리프트 시뮬레이션: 서버를 띄운 상태에서 `python scripts/simulate_drift.py` (정상 배치 → 드리프트 배치 전송).
+
 ## 대시보드 (serving_app/static/index.html)
 
 | 탭 | 내용 |
@@ -41,7 +50,8 @@ uvicorn serving_app.main:app --host 0.0.0.0 --port 8077
 | 데이터 | CSV 업로드, 데이터셋 통계, 데이터 출처 |
 | 시스템 | 서버 설정값, 운영 로그 조회 |
 
-- 드리프트 배치: 정상 배치와 같은 랜덤워크로 만들되 변동성(σ)을 3배로 키워 강제로 드리프트를 일으킨다.
+- 드리프트 배치: 정상 배치와 같은 랜덤워크로 만들되 변동성(σ)을 6배로 키워 강제로 드리프트를 일으킨다.
+- 드리프트 판정: 최근 `WINDOW_SIZE`건 예측의 오차율 RMSE(%)가 `RMSE_THRESHOLD`(5%)를 넘으면 드리프트. 정상 배치 약 1.2%, 드리프트 배치 약 7.1%.
 - 입력 길이, 판정 윈도우, 입력 피처, 기준값은 `/system/info`에서 받는다. 화면 코드는 상수를 따로 갖지 않는다.
 
 ## API
@@ -66,7 +76,9 @@ uvicorn serving_app.main:app --host 0.0.0.0 --port 8077
 
 ## 진행 상황
 
-### 완료: 백엔드 · 프론트엔드
+### 완료
+
+백엔드 · 프론트엔드
 
 - `serving_app/schemas.py`: 요청·응답 필드를 CSV 컬럼명으로 변경 (`HourlyPoint`, `predicted_energy_kwh`, `energy_series`)
 - `serving_app/routers/predict.py`, `data.py`: 새 필드명, 업로드 검증, 판정 윈도우 상수 사용

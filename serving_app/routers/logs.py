@@ -5,8 +5,7 @@ monitoring/retrain_trigger.py의 "aiops" 로거가 그대로 기록하는 logs/a
 serving_app/main.py에서 앱 시작 시 한 번만 구성한다).
 
 드리프트 감지("[WARN] drift detected") -> 재학습 트리거("[INFO] retrain triggered") ->
-게이트 통과("[OK] new_rmse=...")가 실제로 이 파일에 순서대로 쌓이는지 확인하는 것이
-Day3 실습의 검증 포인트다.
+게이트 통과("[OK] new_rmse=...")가 이 파일에 순서대로 쌓인다.
 """
 import os
 

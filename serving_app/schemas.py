@@ -9,7 +9,7 @@ FastAPI 요청/응답 Pydantic 스키마.
 LSTM은 최근 SEQ_LEN시간의 흐름을 입력받으므로 /predict는 SEQ_LEN개 시퀀스를 요청 본문으로 받는다.
 길이(SEQ_LEN)와 값 범위를 스키마 단에서 검증해, 학습 시점 입력(data/features.py)과 어긋나지 않게 한다.
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PositiveFloat
 
 from data.features import SEQ_LEN
 
@@ -40,7 +40,8 @@ class PredictResponse(BaseModel):
 class BatchTestRequest(BaseModel):
     # 드리프트 시뮬레이션용. SEQ_LEN + N개의 연속된 사용량을 보내면 서버가 슬라이딩 윈도우로
     # 잘라 N건을 연속 예측한다. (습도·온도는 시뮬레이션이므로 routers/predict.py의 고정값 사용)
-    energy_series: list[float] = Field(..., min_length=SEQ_LEN + 1)
+    # 드리프트 판정이 실제값 대비 오차율(%)이라 0 이하 값은 받지 않는다.
+    energy_series: list[PositiveFloat] = Field(..., min_length=SEQ_LEN + 1)
 
 
 class BatchTestResponse(BaseModel):
