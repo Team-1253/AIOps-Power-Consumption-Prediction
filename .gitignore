@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 실행 시 생성되는 파일
+mlruns/
+mlartifacts/
+mlflow.db
+logs/
+requests.log
+data/uploads/*.csv
+serving_app/models/*.keras
+serving_app/models/*.pkl
+
+# OS / 편집기
+.DS_Store
+.vscode/
