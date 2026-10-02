@@ -594,7 +594,7 @@ const RANGE_OPTIONS = [
   { label: "24시간", sec: 86400 },
 ];
 const NORMAL_SIGMA = 0.012;
-const DRIFT_SIGMA = NORMAL_SIGMA * 3;
+const DRIFT_SIGMA = NORMAL_SIGMA * 6; // 오차율 약 7%로 드리프트 임계값(5%)을 넘김
 const PIPELINE_STAGES = [
   { title: "데이터 수집", desc: "요청 수신", icon: "i-collect" },
   { title: "데이터 모니터링", desc: "예측 기록 누적", icon: "i-observe" },
@@ -630,6 +630,7 @@ function icon(id) { return `<svg><use href="#${id}"/></svg>`; }
 function badge(kind, text, iconId) { return `<span class="badge ${kind}">${iconId ? icon(iconId) : ""}${esc(text)}</span>`; }
 function fmtNum(v, digits = 1) { return v == null || Number.isNaN(Number(v)) ? "-" : Number(v).toLocaleString("ko-KR", { maximumFractionDigits: digits, minimumFractionDigits: digits }); }
 function fmtKwh(v, digits = 1) { return v == null ? "-" : `${fmtNum(v, digits)} ${UNIT}`; }
+function fmtPct(v, digits = 2) { return v == null ? "-" : `${fmtNum(v, digits)}%`; }
 function randn() {
   let u = 0, v = 0;
   while (u === 0) u = Math.random();
@@ -642,11 +643,12 @@ function randomWalk(n, base, sigma) {
   for (let i = 0; i < n; i++) { lv += randn() * sigma; out.push(Math.exp(lv)); }
   return out;
 }
+// 오차율 RMSE(%): 서버 drift_detector.compute_rmse와 같은 식
 function rmseOf(actual, predicted) {
   const n = Math.min(actual.length, predicted.length);
   if (n === 0) return null;
   let sum = 0;
-  for (let i = 0; i < n; i++) sum += (actual[i] - predicted[i]) ** 2;
+  for (let i = 0; i < n; i++) sum += ((actual[i] - predicted[i]) / actual[i] * 100) ** 2;
   return Math.sqrt(sum / n);
 }
 function sparkline(values) {
@@ -730,7 +732,7 @@ async function loadSystemInfo() {
     ["레지스트리 모델명", data.model_name],
     [`배포 게이트 RMSE (${UNIT})`, data.rmse_gate],
     ["드리프트 판정 윈도우 (건)", data.drift_window_size],
-    [`드리프트 임계값 (${UNIT})`, data.drift_rmse_threshold],
+    ["드리프트 임계값 (%)", data.drift_rmse_threshold],
     ["기본 학습 epoch", data.base_epochs],
     ["재학습 epoch", data.fine_tune_epochs],
     ["재학습 학습률", data.fine_tune_lr],
@@ -775,7 +777,7 @@ async function loadKpis() {
     { label: "평균 응답시간", icon: "i-clock", value: totalReq ? `${avgLatency.toFixed(0)} ms` : "-", spark: latencies, note: `최근 ${rangeLabel()}` },
     { label: "성공률", icon: "i-ok", value: totalReq ? `${successRate.toFixed(1)}%` : "-", spark: successRates, note: `최근 ${rangeLabel()}`, alert: totalReq > 0 && successRate < 95 },
     { label: "모델 RMSE", icon: "i-register", value: currentRmse != null ? fmtKwh(currentRmse, 2) : "-", spark: rmseHistory, note: "등록 버전별 추이", alert: over(currentRmse) },
-    { label: "드리프트 RMSE", icon: "i-detect", value: driftRmse != null ? fmtKwh(driftRmse, 2) : "미실행", spark: batchRmseHistory, note: threshold != null ? `임계값 ${fmtKwh(threshold, 2)}` : "배치 전송 시 표시", alert: over(driftRmse) },
+    { label: "드리프트 RMSE", icon: "i-detect", value: driftRmse != null ? fmtPct(driftRmse, 2) : "미실행", spark: batchRmseHistory, note: threshold != null ? `임계값 ${fmtPct(threshold, 2)}` : "배치 전송 시 표시", alert: over(driftRmse) },
   ];
   document.getElementById("kpi-grid").innerHTML = cards.map((c) => `
     <div class="kpi ${c.alert ? "alert" : ""}">
@@ -1051,7 +1053,7 @@ async function sendBatch(kind) {
     else if (check.status === "retrain_triggered" && check.promoted === false) line = badge("err", `드리프트 감지 · 게이트 미통과 · 기존 버전 유지 (재학습 RMSE ${serverRmse})`, "i-err");
     else if (check.status === "retrain_triggered") line = badge("warn", "드리프트 감지 · 재학습 트리거", "i-warn");
     else line = badge("muted", "정상", "i-ok");
-    statusEl.innerHTML = `${line}${badge("muted", `배치 RMSE ${clientRmse != null ? fmtKwh(clientRmse, 2) : "-"}`)}`;
+    statusEl.innerHTML = `${line}${badge("muted", `배치 RMSE ${clientRmse != null ? fmtPct(clientRmse, 2) : "-"}`)}`;
     showResult(resultBox, data, false);
   } catch (e) {
     statusEl.innerHTML = badge("err", "연결 실패", "i-err");

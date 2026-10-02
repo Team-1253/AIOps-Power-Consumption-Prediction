@@ -1,8 +1,14 @@
+# torch(XPU)는 기본 인덱스에 없으므로 extra-index 필요:
+#   uv pip install --extra-index-url https://download.pytorch.org/whl/xpu -r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/xpu
+
 fastapi==0.141.1
 uvicorn[standard]==0.46.0
 pydantic==2.13.3
 numpy==2.4.4
-tensorflow==2.21.0
+pandas==3.0.6
+scikit-learn==1.9.1
+torch==2.13.0+xpu
 mlflow==3.16.0
 requests==2.33.1
 python-multipart==0.0.20

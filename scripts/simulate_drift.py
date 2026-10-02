@@ -1,10 +1,10 @@
 """
-Day3 드리프트 감지 시뮬레이션 (119~123번 슬라이드).
+드리프트 감지 시뮬레이션.
 
 핵심 프로세스:
-    1) 기준 통계 산출   - 학습에 쓴 3년치 HAIC 데이터의 평균·표준편차 계산
-    2) 정상 입력 테스트 - 같은 분포의 데이터로 예측 -> RMSE $4 이내 확인 (베이스라인)
-    3) 드리프트 데이터 생성 - 변동성을 인위적으로 3배 키운 가격 데이터 생성
+    1) 기준 통계 산출   - 업로드한 전력 데이터 최근 BASE_ROWS시간의 사용량 평균·표준편차 계산
+    2) 정상 입력 테스트 - 같은 분포의 데이터로 예측 -> RMSE가 임계값(RMSE_THRESHOLD) 이내인지 확인 (베이스라인)
+    3) 드리프트 데이터 생성 - 변동성을 인위적으로 6배 키운 사용량 데이터 생성
     4) 드리프트 데이터 주입 - 생성한 데이터를 서빙 서버에 연속 요청으로 전송
     5) 결과 관찰       - RMSE 상승 -> 알림 로그 발생 -> 재학습 트리거 확인
 
@@ -28,8 +28,9 @@ import numpy as np
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.features import load_rows
-from data.storage import latest_upload
+from data.storage import latest_upload, read_complete_rows
+from serving_app.monitoring.drift_detector import WINDOW_SIZE
+from serving_app.schemas import INPUT_LEN
 
 # 보낼 서버 목록. API_URL 은 main() 에서 --target 에 따라 바뀝니다.
 TARGETS = {
@@ -38,53 +39,56 @@ TARGETS = {
 }
 API_URL = f"{TARGETS['local']}/predict/batch-test"
 
-# 기준 통계용 데이터: 호스트의 data/uploads/ 에 업로드한 CSV가 없으면 학습에 쓰인 예시 데이터로 계산합니다.
-SAMPLE_CSV = "data/sample_haic_prices.csv"
+# 기준 통계용 데이터: 호스트의 data/uploads/ 에 업로드한 CSV가 없으면 정제 원본 데이터로 계산합니다.
+SAMPLE_CSV = "data/hourly_clean.csv"
+# 기준값은 최근 BASE_ROWS행으로 계산한다 (대시보드 배치 기준값과 같은 방식: routers/system.py BASE_ROWS).
+# 사용량이 해마다 크게 늘어서, 전체 평균을 쓰면 현재 수준보다 훨씬 낮은 값이 기준이 된다.
+BASE_ROWS = 100
 
 
 def compute_baseline_stats(csv_path: str | None = None) -> tuple[float, float]:
-    """1단계: 학습에 사용한 데이터(업로드된 최신 CSV)의 평균·표준편차."""
+    """1단계: 업로드된 최신 CSV의 최근 BASE_ROWS행 사용량 평균·표준편차."""
     if csv_path is None:
         try:
             csv_path = latest_upload()
         except FileNotFoundError:
             csv_path = SAMPLE_CSV
             print(f"[info] 업로드된 CSV가 없어 {SAMPLE_CSV} 로 기준 통계를 계산합니다.")
-    rows = load_rows(csv_path)
-    closes = np.array([r["Close"] for r in rows])
-    return float(closes.mean()), float(closes.std())
+    _, rows = read_complete_rows(csv_path, ("date_utc", "time_utc"), ("energy_kwh",))
+    energy = np.array([r["energy_kwh"] for r in rows[-BASE_ROWS:]])
+    return float(energy.mean()), float(energy.std())
 
 
-# SEQ_LEN(20) + WINDOW_SIZE(21) = 41개를 보내야 배치 하나당 정확히 WINDOW_SIZE(21)개의
+# INPUT_LEN(25) + WINDOW_SIZE(24) = 49개를 보내야 배치 하나당 정확히 WINDOW_SIZE(24)개의
 # (predicted, actual) 쌍이 쌓여, drift_detector.py가 바로 판정할 수 있다.
-BATCH_N = 41
+BATCH_N = INPUT_LEN + WINDOW_SIZE
 
-# 학습 데이터(실제 IBM 시세 기반)는 추세·모멘텀이 있는 시계열이라, 평균 주변의 순수
-# 백색잡음(iid noise)을 넣으면 "정상" 입력조차 모델이 못 맞춰 오탐(false positive)이
-# 납니다. 그래서 정상/드리프트 배치 모두 일별 수익률(log return) 기반의 랜덤워크로
-# 만들고, 그 수익률의 표준편차(변동성)만 다르게 줍니다.
-NORMAL_SIGMA = 0.012  # 학습 데이터의 안정적 구간과 비슷한 일별 변동성 (~1.2%)
-DRIFT_SIGMA = NORMAL_SIGMA * 3  # 변동성을 3배 키운 드리프트
+# 전력 사용량은 직전 값에 이어지는 시계열이라, 평균 주변의 순수 백색잡음(iid noise)을 넣으면
+# "정상" 입력조차 모델이 못 맞춰 오탐(false positive)이 납니다. 그래서 정상/드리프트 배치 모두
+# 시간당 변화율(log) 기반의 랜덤워크로 만들고, 그 변화율의 표준편차(변동성)만 다르게 줍니다.
+# 대시보드(static/index.html)의 배치 주입과 같은 값입니다.
+NORMAL_SIGMA = 0.012  # 시간당 변동성 (~1.2%)
+DRIFT_SIGMA = NORMAL_SIGMA * 6  # 변동성을 6배 키운 드리프트 (오차율 약 7%로 임계값 5%를 넘김)
 
 
 def _random_walk(n: int, base: float, sigma: float) -> np.ndarray:
-    log_returns = np.random.normal(0, sigma, n)
-    return base * np.exp(np.cumsum(log_returns))
+    rel_changes = np.random.normal(0, sigma, n)
+    return base * np.exp(np.cumsum(rel_changes))
 
 
-def generate_normal_batch(n=BATCH_N, base=165.0, sigma=NORMAL_SIGMA):
+def generate_normal_batch(base: float, n=BATCH_N, sigma=NORMAL_SIGMA):
     """학습 데이터와 비슷한 변동성의 정상 입력(랜덤워크)."""
     return _random_walk(n, base, sigma)
 
 
-def generate_drift_batch(n=BATCH_N, base=165.0, sigma=DRIFT_SIGMA):
-    """변동성을 3배 키운 드리프트 입력 (의도적으로 오차 유발)."""
+def generate_drift_batch(base: float, n=BATCH_N, sigma=DRIFT_SIGMA):
+    """변동성을 6배 키운 드리프트 입력 (의도적으로 오차 유발)."""
     return _random_walk(n, base, sigma)
 
 
-def send_batch(prices: np.ndarray, label: str) -> dict:
-    """Day3 정답 구현: 생성한 배치를 /predict/batch-test 엔드포인트로 전송한다."""
-    resp = requests.post(API_URL, json={"prices": prices.tolist()})
+def send_batch(energy_series: np.ndarray, label: str) -> dict:
+    """생성한 배치를 /predict/batch-test 엔드포인트로 전송한다."""
+    resp = requests.post(API_URL, json={"energy_series": energy_series.tolist()})
     resp.raise_for_status()
     result = resp.json()
     print(f"[{label}] drift_check = {result['drift_check']}")
@@ -99,7 +103,7 @@ def _summary(check: dict) -> str:
 
 def main():
     global API_URL
-    parser = argparse.ArgumentParser(description="HAIC 드리프트 감지 시뮬레이션")
+    parser = argparse.ArgumentParser(description="전력 사용량 드리프트 감지 시뮬레이션")
     parser.add_argument("--target", choices=["local", "container", "both"], default="local",
                         help="local=8077, container=8099, both=같은 배치를 두 서버에 보내 비교")
     args = parser.parse_args()

@@ -32,6 +32,15 @@ uvicorn serving_app.main:app --host 0.0.0.0 --port 8077
 대시보드 `http://localhost:8077/`, API 문서 `http://localhost:8077/docs`.
 모델을 MLflow에서 불러올 때는 `MODEL_SOURCE=mlflow`, 서버 시작 시 바로 불러올 때는 `LOADING_MODE=eager`를 붙인다.
 
+모델 준비 (최초 1회, 대시보드에서 `data/hourly_clean.csv`를 업로드한 뒤):
+
+```bash
+python scripts/train_baseline_v1.py        # scaler.pkl, power_v1.keras 생성 (MODEL_SOURCE=local용)
+python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시 Production 승격
+```
+
+드리프트 시뮬레이션: 서버를 띄운 상태에서 `python scripts/simulate_drift.py` (정상 배치 → 드리프트 배치 전송).
+
 ## 대시보드 (serving_app/static/index.html)
 
 | 탭 | 내용 |
@@ -41,7 +50,8 @@ uvicorn serving_app.main:app --host 0.0.0.0 --port 8077
 | 데이터 | CSV 업로드, 데이터셋 통계, 데이터 출처 |
 | 시스템 | 서버 설정값, 운영 로그 조회 |
 
-- 드리프트 배치: 정상 배치와 같은 랜덤워크로 만들되 변동성(σ)을 3배로 키워 강제로 드리프트를 일으킨다.
+- 드리프트 배치: 정상 배치와 같은 랜덤워크로 만들되 변동성(σ)을 6배로 키워 강제로 드리프트를 일으킨다.
+- 드리프트 판정: 최근 `WINDOW_SIZE`건 예측의 오차율 RMSE(%)가 `RMSE_THRESHOLD`(5%)를 넘으면 드리프트. 정상 배치 약 1.2%, 드리프트 배치 약 7.1%.
 - 입력 길이, 판정 윈도우, 입력 피처, 기준값은 `/system/info`에서 받는다. 화면 코드는 상수를 따로 갖지 않는다.
 
 ## API
@@ -66,7 +76,9 @@ uvicorn serving_app.main:app --host 0.0.0.0 --port 8077
 
 ## 진행 상황
 
-### 완료: 백엔드 · 프론트엔드
+### 완료
+
+백엔드 · 프론트엔드
 
 - `serving_app/schemas.py`: 요청·응답 필드를 CSV 컬럼명으로 변경 (`HourlyPoint`, `predicted_energy_kwh`, `energy_series`)
 - `serving_app/routers/predict.py`, `data.py`: 새 필드명, 업로드 검증, 판정 윈도우 상수 사용
@@ -74,31 +86,26 @@ uvicorn serving_app.main:app --host 0.0.0.0 --port 8077
 - `data/storage.py`: 대시보드 통계·업로드 검증용 CSV 읽기 함수(`read_complete_rows`) 추가
 - `serving_app/static/index.html`: 대시보드 전체 교체
 
-### 남은 작업: 모델 (담당 팀원)
+### 남은 작업: 모델 (완료 — feat/model-torch-port)
 
-모델 코드는 아직 HAIC 기준(`Close`, `Volume`)이다. 아래를 맞추면 전체 흐름이 동작한다.
+모델 코드를 PyTorch 에너지 기준으로 포팅했다 (`Close`/`Volume` 잔재 제거됨).
 
-1. `data/features.py`
-   - `load_rows`가 위 CSV 컬럼을 읽도록 변경
-   - 누락 행 처리, 끊긴 구간을 걸치는 시퀀스 제외
-   - `SEQ_LEN` 결정
-   - 스케일러를 3개 피처에 맞게 변경
-2. `serving_app/lstm_model.py`: `N_FEATURES = 3`
-3. `serving_app/model_loader.py`: `predict_one(sequence)` 계약
-   - 입력: `[{"energy_kwh": float, "humi_pct": float, "temp_F": float}, ...]` (SEQ_LEN개, 오래된 시간 → 최근 시간)
-   - 출력: 다음 1시간 `energy_kwh` 예측값 (kWh, float)
-   - `MLFLOW_MODEL_URI`의 모델명을 `MODEL_NAME`과 맞춘다.
+1. `data/features.py` — 에너지 lag 규격 (`load_splits`, `FEATURE_COLS`, `TARGET_COL`,
+   `TIME_COL`, `EnergyScaler`, `tensors_from_rows`), `SEQ_LEN = 24`, 3피처 스케일러
+2. `serving_app/lstm_model.py` — `N_FEATURES = 3`, PyTorch `LSTMRegressor`
+3. `serving_app/model_loader.py` — `predict_one(sequence)` 계약:
+   - 입력: `[{"energy_relative_pct": float, "humi_pct": float, "temp_F": float}, ...]` (SEQ_LEN개)
+   - 출력: 변화율 raw 스칼라 (kWh 역변환은 서빙팀)
+   - `MLFLOW_MODEL_URI` = `models:/GIGA_Energy_LSTM/Production` (`MODEL_NAME`과 일치)
 4. `serving_app/train_and_register.py`
-   - `MODEL_NAME`, `RMSE_GATE`(kWh), epoch 값 결정
-   - `/system/info`, `/models/*`가 이 파일의 최상위 상수(`RMSE_GATE`, `MODEL_NAME`, `BASE_EPOCHS`, `FINE_TUNE_EPOCHS`, `FINE_TUNE_LR`)를 소스에서 읽는다. 상수는 숫자·문자열 리터럴로 유지한다.
-5. `serving_app/monitoring/drift_detector.py`: `RMSE_THRESHOLD`(kWh), `WINDOW_SIZE` 결정
-   - 참고: "직전 값 그대로" 가짜 모델로 대시보드 배치를 보낸 측정값
-     - 기준값 약 2,580 kWh에서 정상 배치 RMSE 약 31 kWh, 드리프트 배치 RMSE 약 98 kWh
-   - 현재 임계값 4.00은 HAIC 값이라 정상 배치도 드리프트로 판정된다.
+   - `MODEL_NAME = "GIGA_Energy_LSTM"`, epoch 상수 유지
+   - `RMSE_GATE = None` (변화율 기준 게이트 미확정 — 데이터 확정 후 팀 합의)
+5. `serving_app/monitoring/drift_detector.py`
+   - `RMSE_THRESHOLD = None` (게이트와 함께 확정 예정), `WINDOW_SIZE = 21` 유지
 6. `serving_app/monitoring/retrain_trigger.py`
-   - 숫자 21을 `WINDOW_SIZE`로 변경
-   - 로그 문구의 모델명 변경
-   - 대시보드가 `[WARN]`, `[OK]` 접두어로 알람 색을 구분하므로 접두어는 유지한다.
-7. `scripts/train_baseline_v1.py`, `scripts/simulate_drift.py`, `serving_app/Dockerfile`
-   - 요청 필드 `energy_series` 반영
-   - 빌드용 시드 CSV를 `data/sample_haic_prices.csv`에서 전력 데이터로 교체
+   - `WINDOW_SIZE` 상수 사용, 로그 모델명 `MODEL_NAME` 연동
+   - 최근 행 조회는 `read_complete_rows` (에너지 컬럼) 경유
+7. `scripts/simulate_drift.py`
+   - `energy_series` 요청 필드 반영, `BATCH_N = SEQ_LEN + WINDOW_SIZE`
+   - 빌드용 시드 CSV 교체(`sample_haic_prices.csv` → 전력 데이터)는 데이터셋 담당과 협의 필요
+   - baseline 스크립트(`train_baseline_v1.py`)는 삭제 — baseline `.pt`는 노트북 산출물
