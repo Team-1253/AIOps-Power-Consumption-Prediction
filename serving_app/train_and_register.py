@@ -1,123 +1,290 @@
 """
-Day2: MLflow로 HAIC LSTM 모델을 학습 -> 기록(Tracking) -> 게이트 검증 -> 등록(Registry) -> Production 승격.
-Day3: 드리프트 감지 후 Production 가중치에서 이어서 학습하는 fine-tuning 재학습.
+MLflow로 에너지 LSTM을 학습 -> 기록(Tracking) -> 게이트 검증 -> 등록(Registry) -> Production 승격.
+드리프트 감지 후 Production 가중치에서 이어서 학습하는 fine-tuning 재학습.
 
-실습 시나리오 (94번 슬라이드를 LSTM 버전으로 재구성):
-    1) HAIC 데이터로 base 모델 학습(50 epoch) -> RMSE 확인 (게이트 미달 가능)
-    2) 게이트($4.00) 통과 시 Production으로 승격
-    3) (Day3) 드리프트 감지 시 Production 가중치에서 warm-start -> 최근 1개월 데이터로
-       10 epoch만 fine-tuning (처음부터 다시 학습하지 않음 - 21거래일로는 스크래치 학습이 불안정)
+노트북 `gigatime_LSTM_ML.ipynb` Cell 16(학습 루프+EarlyStopping) / Cell 18(평가) /
+Cell 12(DataLoader) / Cell 21(저장)을 PyTorch + MLflow 형태로 이식.
 
-실행:
-    (대시보드에서 HAIC CSV를 먼저 업로드하세요 - data/sample_haic_prices.csv가 예시입니다)
-    python scripts/train_baseline_v1.py     # 최초 1회 (scaler.pkl 생성)
+데이터 인터페이스 (데이터셋 담당 제공, `data/features.py`):
+    load_splits() -> (train_df, valid_df, test_df)  # pandas DataFrame
+    FEATURE_COLS: list[str]  # 입력 피처 컬럼 (현재 lag 72개: temp/humi/energy x 24h)
+    TARGET_COL: str          # 타깃 컬럼 (수치 → 변화율로 변경 중, 확정 후 반영)
+    TIME_COL: str            # 시간 컬럼
+    load_scaler(path)        # fit済 스케일러 (transform/inverse_transform 제공)
+이 파일은 스케일러를 fit하지 않는다 (스케일링은 데이터셋 담당 영역).
+
+실행 (project/ 루트에서):
     python serving_app/train_and_register.py
 """
+
+import copy
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import mlflow
-import mlflow.tensorflow
 import numpy as np
-from mlflow.tracking import MlflowClient
-from tensorflow import keras
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
-from data.features import load_rows, build_sequences, train_test_split, HAICScaler
-from data.storage import latest_upload
-from serving_app.lstm_model import build_model
+from serving_app.lstm_model import N_FEATURES, build_model, get_device, set_seed
 
-# 시드 고정: LSTM 가중치 초기화가 랜덤이라 시드 없이는 실행마다 RMSE가 크게 흔들려
-# (관찰치: 2.22~5.29) 게이트($4.00) 통과 여부가 운에 좌우됩니다. numpy/tensorflow/python
-# random을 한 번에 고정해 재현 가능한 학습 결과를 보장합니다.
 SEED = 42
-keras.utils.set_random_seed(SEED)
+DEVICE = get_device()
 
-RMSE_GATE = 4.00
-MODEL_NAME = "HAIC_Predictor"
-SCALER_PATH = "serving_app/models/scaler.pkl"
-BASE_EPOCHS = 100  # 3층 LSTM + 3년치 데이터 기준, RMSE가 안정적으로 게이트 아래로 수렴하는 지점
+BATCH_SIZE = 64  # Arc 140V 공유메모리 OOM 방지 (노트북 256 → 64)
+LR = 1e-3
+BASE_EPOCHS = 50  # 노트북 EPOCHS
+PATIENCE = 7  # 노트북 EarlyStopping patience
 FINE_TUNE_EPOCHS = 10
-FINE_TUNE_LR = 1e-4  # base 학습(1e-3)보다 낮은 학습률로 살짝만 갱신
+FINE_TUNE_LR = 1e-4  # base(1e-3)보다 낮게 살짝만 갱신
+
+MODEL_NAME = "GIGA_Energy_LSTM"
+LOCAL_MODEL_PATH = "serving_app/models/energy_lstm.pt"
+
+# NOTE(성능보류): 타깃이 수치 → 변화율로 변경 중이라 게이트 값 미확정.
+# 데이터 확정 후 팀 합의로 설정. None이면 등록은 하되 promoted=False로 둔다.
+# (plain 대입 유지: routers/system.py가 AST 파싱으로 이 상수를 읽는다)
+RMSE_GATE = None
 
 
 def rmse(y_true, y_pred) -> float:
     return float(np.sqrt(np.mean((np.array(y_true) - np.array(y_pred)) ** 2)))
 
 
-def _prepare(rows: list[dict], scaler: HAICScaler):
-    X, y = build_sequences(rows, scaler)
-    X_train, y_train, X_test, y_test = train_test_split(X, y)
-    X_train = np.array(X_train, dtype="float32")
-    X_test = np.array(X_test, dtype="float32")
-    y_train_scaled = np.array([scaler.scale_close(v) for v in y_train], dtype="float32")
-    return X_train, y_train_scaled, X_test, y_test
+def mae(y_true, y_pred) -> float:
+    return float(np.mean(np.abs(np.array(y_true) - np.array(y_pred))))
 
 
-def _register_if_gate_passed(model, run_id: str, score: float) -> dict:
+def _make_loaders(X_train, y_train, X_valid, y_valid, X_test, y_test):
+    def _loader(X, y, shuffle):
+        return DataLoader(
+            TensorDataset(
+                torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32)),
+                torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32)),
+            ),
+            batch_size=BATCH_SIZE,
+            shuffle=shuffle,
+            num_workers=0,
+            pin_memory=False,
+        )
+
+    return (
+        _loader(X_train, y_train, True),
+        _loader(X_valid, y_valid, False),
+        _loader(X_test, y_test, False),
+    )
+
+
+def _load_tensors(scaler):
+    """데이터셋 담당의 load_splits() + 스케일러로 학습 텐서 준비. (노트북 Cell 7/11)"""
+    from data.features import FEATURE_COLS, TARGET_COL, TIME_COL, load_splits
+
+    train_df, valid_df, test_df = load_splits()
+    n_feat = len(FEATURE_COLS)
+    seq_len = n_feat // N_FEATURES  # timestep당 [temp, humi, energy] N_FEATURES개
+
+    def _xy(df):
+        X = df[FEATURE_COLS].to_numpy(dtype=np.float32).reshape(-1, seq_len, N_FEATURES)
+        y = df[TARGET_COL].to_numpy(dtype=np.float32)
+        ts = df[TIME_COL].to_numpy()
+        return X, y, ts
+
+    X_train, y_train, ts_train = _xy(train_df)
+    X_valid, y_valid, ts_valid = _xy(valid_df)
+    X_test, y_test, ts_test = _xy(test_df)
+
+    X_train_s = scaler.transform_X(X_train)
+    X_valid_s = scaler.transform_X(X_valid)
+    X_test_s = scaler.transform_X(X_test)
+    y_train_s = scaler.transform_y(y_train)
+    y_valid_s = scaler.transform_y(y_valid)
+    y_test_s = scaler.transform_y(y_test)
+    return (X_train_s, y_train_s, ts_train), (X_valid_s, y_valid_s, ts_valid), (
+        X_test_s,
+        y_test_s,
+        ts_test,
+    )
+
+
+def evaluate(model, loader, scaler) -> tuple[float, float]:
+    """노트북 Cell 16 evaluate_loader. 역스케일 후 RMSE/MAE."""
+    model.eval()
+    preds, actuals = [], []
+    with torch.no_grad():
+        for xb, yb in loader:
+            preds.append(model(xb.to(DEVICE)).cpu().numpy())
+            actuals.append(yb.numpy())
+    pred = scaler.inverse_y(np.concatenate(preds))
+    actual = scaler.inverse_y(np.concatenate(actuals))
+    return rmse(actual, pred), mae(actual, pred)
+
+
+def _fit(model, train_loader, valid_loader, scaler, epochs, lr) -> dict:
+    """노트북 Cell 16 학습 루프 + EarlyStopping + best 복원."""
+    criterion = nn.MSELoss()
+    # XPU OOM fix: foreach Adam이 Level Zero에서 OOM → single-tensor 경로 강제
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, foreach=False)
+    best_rmse = float("inf")
+    best_state = None
+    patience = 0
+    history = []
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(DEVICE, non_blocking=False), yb.to(DEVICE, non_blocking=False)
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+            del loss
+        if DEVICE.type == "xpu":
+            torch.xpu.empty_cache()
+        train_rmse, _ = evaluate(model, train_loader, scaler)
+        val_rmse, val_mae = evaluate(model, valid_loader, scaler)
+        if DEVICE.type == "xpu":
+            torch.xpu.empty_cache()
+        history.append((epoch, train_rmse, val_rmse, val_mae))
+        print(
+            f"Epoch {epoch:02d} | Train RMSE {train_rmse:.4f} "
+            f"| Val RMSE {val_rmse:.4f} | Val MAE {val_mae:.4f}"
+        )
+        if val_rmse < best_rmse:
+            best_rmse = val_rmse
+            best_state = copy.deepcopy(model.state_dict())
+            patience = 0
+        else:
+            patience += 1
+            if patience >= PATIENCE:
+                print("Early stopping.")
+                break
+
+    model.load_state_dict(best_state)
+    return {"best_val_rmse": best_rmse, "history": history}
+
+
+def _register_if_gate_passed(model, run_id: str, score: float, X_example) -> dict:
+    import mlflow
+    import mlflow.pytorch as mlflow_pytorch
+    from mlflow.tracking import MlflowClient
+
+    mlflow_pytorch.log_model(model, name="model", input_example=X_example)
     result = {"run_id": run_id, "rmse": score, "promoted": False}
+    if RMSE_GATE is None:
+        print(f"[GATE PENDING] rmse={score:.4f} -> 게이트 미확정(변화율 타깃 확정 후 설정)")
+        return result
     if score <= RMSE_GATE:
         v = mlflow.register_model(f"runs:/{run_id}/model", MODEL_NAME)
-        MlflowClient().transition_model_version_stage(name=MODEL_NAME, version=v.version, stage="Production")
+        MlflowClient().transition_model_version_stage(
+            name=MODEL_NAME, version=v.version, stage="Production"
+        )
         result["promoted"] = True
         result["version"] = v.version
-        print(f"[GATE PASSED] rmse={score:.2f} -> {MODEL_NAME} v{v.version} promoted to Production")
+        print(f"[GATE PASSED] rmse={score:.4f} -> {MODEL_NAME} v{v.version} Production")
     else:
-        print(f"[GATE FAILED] rmse={score:.2f} > {RMSE_GATE} -> 배포 차단, 기존 Production 유지")
+        print(f"[GATE FAILED] rmse={score:.4f} > {RMSE_GATE} -> 배포 차단")
     return result
 
 
-def train_and_register(csv_path: str | None = None, rows: list[dict] | None = None) -> dict:
-    """Day2: 처음부터(scratch) 학습. 데이터가 충분한 base 학습에서만 사용합니다.
+def _save_local(model, scaler, feature_cols, target_col, seq_len) -> None:
+    os.makedirs(os.path.dirname(LOCAL_MODEL_PATH), exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "scaler": scaler,
+            "input_shape": (seq_len, N_FEATURES),
+            "feature_order": list(feature_cols),
+            "target": target_col,
+        },
+        LOCAL_MODEL_PATH,
+    )
+    print(f"saved -> {LOCAL_MODEL_PATH}")
 
-    csv_path를 지정하지 않으면 data/uploads/에 가장 최근 업로드된 CSV를 사용합니다
-    (data/storage.py의 latest_upload() - 대시보드에서 업로드한 파일).
-    """
-    if rows is None:
-        rows = load_rows(csv_path or latest_upload())
-    scaler = HAICScaler.load(SCALER_PATH)
-    X_train, y_train_scaled, X_test, y_test = _prepare(rows, scaler)
+
+def train_and_register() -> dict:
+    """처음부터(scratch) 학습. base 학습에서만 사용."""
+    import mlflow
+
+    from data.features import FEATURE_COLS, TARGET_COL, load_scaler
+
+    set_seed(SEED)
+    scaler = load_scaler()
+    (Xtr, ytr, _), (Xva, yva, _), (Xte, yte, _) = _load_tensors(scaler)
+    train_loader, valid_loader, test_loader = _make_loaders(Xtr, ytr, Xva, yva, Xte, yte)
 
     with mlflow.start_run(run_name="base-train"):
         model = build_model()
-        model.fit(X_train, y_train_scaled, epochs=BASE_EPOCHS, verbose=0)
-
-        preds = [scaler.inverse_close(p) for p in model.predict(X_test, verbose=0).flatten()]
-        score = rmse(y_test, preds)
+        stats = _fit(model, train_loader, valid_loader, scaler, BASE_EPOCHS, LR)
+        test_rmse, test_mae = evaluate(model, test_loader, scaler)
+        print(f"=== Final Test ===\nRMSE: {test_rmse:.4f}\nMAE : {test_mae:.4f}")
 
         mlflow.log_param("mode", "scratch")
         mlflow.log_param("epochs", BASE_EPOCHS)
-        mlflow.log_metric("rmse", score)
-        mlflow.tensorflow.log_model(model, name="model", input_example=X_train[:1])
+        mlflow.log_param("batch_size", BATCH_SIZE)
+        mlflow.log_metric("best_val_rmse", stats["best_val_rmse"])
+        mlflow.log_metric("test_rmse", test_rmse)
+        mlflow.log_metric("test_mae", test_mae)
+        _save_local(model, scaler, FEATURE_COLS, TARGET_COL, Xtr.shape[1])
 
-        return _register_if_gate_passed(model, mlflow.active_run().info.run_id, score)
+        return _register_if_gate_passed(
+            model, mlflow.active_run().info.run_id, test_rmse, Xtr[:1]
+        )
 
 
-def fine_tune(rows: list[dict]) -> dict:
+def fine_tune(rows=None, recent_frac: float | None = None) -> dict:
+    """현재 Production 가중치에서 이어서(warm start) 짧게 fine-tuning. Day3 재학습용.
+
+    rows: 최근 원시 행 목록 (retrain_trigger가 넘겨주는 방식). 데이터셋 담당이
+        data.features.tensors_from_rows(rows, scaler)를 제공하면 그걸 쓰고,
+        없으면 split tail로 대체한다 (아래 recent_frac 동작).
+    recent_frac: train split의 시간순 뒷부분만 사용 (예: 0.1 = 최근 10%).
+        Day3 드리프트 대응 시 최근 데이터로만 갱신할 때 지정한다.
+    둘 다 None이면 전체 split 사용 (기본 동작).
     """
-    Day3: 현재 Production 모델 가중치에서 이어서(warm start), 넘겨받은 rows(최근 데이터)로
-    짧게 fine-tuning합니다. rows가 적을 때(예: 최근 1개월)도 스크래치 학습보다 훨씬 안정적입니다.
-    """
-    scaler = HAICScaler.load(SCALER_PATH)
-    X_train, y_train_scaled, X_test, y_test = _prepare(rows, scaler)
+    import mlflow
+    import mlflow.pytorch as mlflow_pytorch
 
-    model = mlflow.tensorflow.load_model(f"models:/{MODEL_NAME}/Production")
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=FINE_TUNE_LR), loss="mse")
+    from data.features import FEATURE_COLS, TARGET_COL, load_scaler
+
+    set_seed(SEED)
+    scaler = load_scaler()
+    if rows is not None:
+        try:
+            from data.features import tensors_from_rows
+
+            Xtr, ytr = tensors_from_rows(rows, scaler)
+            (Xva, yva, _), (Xte, yte, _) = _load_tensors(scaler)[1:]
+        except (ImportError, AttributeError):
+            print("[WARN] tensors_from_rows 미제공 → split tail로 대체 (데이터셋 담당 확인 요망)")
+            rows = None
+    if rows is None:
+        (Xtr, ytr, _), (Xva, yva, _), (Xte, yte, _) = _load_tensors(scaler)
+        if recent_frac is not None:
+            cut = max(1, int(len(Xtr) * recent_frac))
+            Xtr, ytr = Xtr[-cut:], ytr[-cut:]
+    train_loader, valid_loader, test_loader = _make_loaders(Xtr, ytr, Xva, yva, Xte, yte)
+
+    model = mlflow_pytorch.load_model(f"models:/{MODEL_NAME}/Production")
+    model.to(DEVICE)
 
     with mlflow.start_run(run_name="fine-tune"):
-        model.fit(X_train, y_train_scaled, epochs=FINE_TUNE_EPOCHS, verbose=0)
-
-        preds = [scaler.inverse_close(p) for p in model.predict(X_test, verbose=0).flatten()]
-        score = rmse(y_test, preds)
+        stats = _fit(model, train_loader, valid_loader, scaler, FINE_TUNE_EPOCHS, FINE_TUNE_LR)
+        test_rmse, test_mae = evaluate(model, test_loader, scaler)
+        print(f"=== Fine-tune Test ===\nRMSE: {test_rmse:.4f}\nMAE : {test_mae:.4f}")
 
         mlflow.log_param("mode", "fine-tune")
         mlflow.log_param("epochs", FINE_TUNE_EPOCHS)
-        mlflow.log_param("n_rows", len(rows))
-        mlflow.log_metric("rmse", score)
-        mlflow.tensorflow.log_model(model, name="model", input_example=X_train[:1])
+        mlflow.log_param("recent_frac", recent_frac if recent_frac is not None else "full")
+        mlflow.log_param("n_train", len(Xtr))
+        mlflow.log_metric("test_rmse", test_rmse)
+        mlflow.log_metric("test_mae", test_mae)
+        _save_local(model, scaler, FEATURE_COLS, TARGET_COL, Xtr.shape[1])
 
-        return _register_if_gate_passed(model, mlflow.active_run().info.run_id, score)
+        return _register_if_gate_passed(
+            model, mlflow.active_run().info.run_id, test_rmse, Xtr[:1]
+        )
 
 
 if __name__ == "__main__":
