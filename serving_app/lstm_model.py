@@ -19,7 +19,8 @@ import torch.nn as nn
 
 SEED = 42
 
-# 입력 shape 기본값. 정식 값(SEQ_LEN/N_FEATURES)은 데이터셋 담당이 확정한다.
+# 입력 shape 기본값 (single source of truth — 다른 모듈은 여기서 import해서 쓸 것).
+# 값 미확정(PENDING): SEQ_LEN/N_FEATURES 최종값은 데이터셋 담당 확정 후 반영.
 # (현재 lag 데이터셋 기준: lag_24h..lag_1h x [temp_F, humi_pct, energy_relative_pct])
 SEQ_LEN = 24
 N_FEATURES = 3

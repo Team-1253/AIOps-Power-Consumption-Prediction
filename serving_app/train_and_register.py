@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from serving_app.lstm_model import build_model, get_device, set_seed
+from serving_app.lstm_model import N_FEATURES, build_model, get_device, set_seed
 
 SEED = 42
 DEVICE = get_device()
@@ -83,10 +83,10 @@ def _load_tensors(scaler):
 
     train_df, valid_df, test_df = load_splits()
     n_feat = len(FEATURE_COLS)
-    seq_len = n_feat // 3  # timestep당 [temp, humi, energy] 3개
+    seq_len = n_feat // N_FEATURES  # timestep당 [temp, humi, energy] N_FEATURES개
 
     def _xy(df):
-        X = df[FEATURE_COLS].to_numpy(dtype=np.float32).reshape(-1, seq_len, 3)
+        X = df[FEATURE_COLS].to_numpy(dtype=np.float32).reshape(-1, seq_len, N_FEATURES)
         y = df[TARGET_COL].to_numpy(dtype=np.float32)
         ts = df[TIME_COL].to_numpy()
         return X, y, ts
@@ -194,7 +194,7 @@ def _save_local(model, scaler, feature_cols, target_col, seq_len) -> None:
         {
             "model_state_dict": model.state_dict(),
             "scaler": scaler,
-            "input_shape": (seq_len, 3),
+            "input_shape": (seq_len, N_FEATURES),
             "feature_order": list(feature_cols),
             "target": target_col,
         },

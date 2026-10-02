@@ -7,10 +7,10 @@
   (템플릿은 scaler.pkl 별도 파일이었으나, torch판은 번들에 스케일러를 동봉해
   가중치-스케일러 불일치를 원천 차단한다)
 
-입력 형식: [{"energy_kwh":.., "humi_pct":.., "temp_F":..}, ...] (오래된 시각 → 최근 시각),
-raw 스케일. 서빙 요청 dict → 이 형식 변환은 schemas.py / routers (서빙 담당) 영역.
-출력: 모델 raw 스칼라 1개. 타깃이 수치 → 변화율로 변경 중이므로,
-변화율→수치 역변환식은 데이터 확정 후 서빙 측에 반영한다 (모델 측은 raw 반환).
+입력 형식: [{"energy_relative_pct":.., "humi_pct":.., "temp_F":..}, ...] SEQ_LEN개
+(오래된 시각 → 최근 시각), raw 스케일. 서빙 요청 dict → 이 형식 변환은
+schemas.py / routers (서빙 담당) 영역.
+출력: 모델 raw 스칼라 1개 (변화율. kWh 역변환은 서빙팀 영역).
 
 환경변수
     LOADING_MODE = lazy(기본값) | eager
@@ -24,7 +24,7 @@ import time
 import numpy as np
 import torch
 
-from serving_app.lstm_model import build_model, get_device
+from serving_app.lstm_model import N_FEATURES, SEQ_LEN, build_model, get_device
 
 LOCAL_MODEL_PATH = "serving_app/models/energy_lstm.pt"
 MLFLOW_MODEL_URI = "models:/GIGA_Energy_LSTM/Production"
@@ -36,7 +36,7 @@ _model_cache = None  # Lazy Loading 캐시
 class LoadedModel:
     """local .pt 번들과 mlflow 두 소스를 동일한 인터페이스로 감싸는 래퍼."""
 
-    def __init__(self, model, scaler, version: str, seq_len: int = 24, n_features: int = 3):
+    def __init__(self, model, scaler, version: str, seq_len: int = SEQ_LEN, n_features: int = N_FEATURES):
         self._model = model.to(DEVICE).eval()
         self.scaler = scaler
         self.version = version
@@ -45,19 +45,16 @@ class LoadedModel:
 
     def predict_one(self, sequence) -> float:
         """
-        sequence: 서빙이 넘기는 24개 행.dict 형식
-            [{"energy_kwh":.., "humi_pct":.., "temp_F":..}, ...] 또는
+        sequence: 서빙이 넘기는 SEQ_LEN개 행.dict 형식
+            [{"energy_relative_pct":.., "humi_pct":.., "temp_F":..}, ...] 또는
             [[temp, humi, energy], ...] — 오래된 시각 -> 최근 시각 순서.
             (seq_len은 번들 input_shape 기준. 윈도우 변경 시 번들 재생성만으로 대응)
-        반환: 모델 raw 출력 1개 (변화율 타깃 확정 전까지는 해석 보류).
-
-        NOTE(변화율移行): 서빙은 energy_kwh(값)를 보내지만 학습 피처의 energy축은
-        energy_relative_pct다. 서빙팀이 상대값 필드로 교체하면 아래 키만 바꾼다.
+        반환: 모델 raw 출력 1개 (변화율. kWh 역변환은 서빙팀 영역).
         """
         triples = []
         for p in sequence:
             if isinstance(p, dict):
-                triples.append([p["temp_F"], p["humi_pct"], p["energy_kwh"]])
+                triples.append([p["temp_F"], p["humi_pct"], p["energy_relative_pct"]])
             else:
                 triples.append(list(p))
         x = np.array(triples, dtype=np.float32).reshape(1, self.seq_len, self.n_features)
