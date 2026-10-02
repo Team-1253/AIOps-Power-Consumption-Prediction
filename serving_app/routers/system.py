@@ -26,7 +26,6 @@ router = APIRouter(prefix="/system")
 
 AIOPS_LOG = os.path.join("logs", "aiops.log")
 TRAIN_SCRIPT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "train_and_register.py")
-BASE_ROWS = 100  # 예시 데이터·배치 기준값을 계산할 최근 행 수
 PEAK_THRESHOLD = None  # 피크 경보 기준값. 정해지면 숫자로 바꾼다 (None이면 화면에서 경보 표시 안 함)
 
 _ALERT_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ \[(\w+)\] (.*)$")
@@ -70,20 +69,10 @@ def _row_time(row: dict) -> str:
 @router.get("/info")
 def info():
     c = _train_constants()
-
-    # 예시 입력·배치 생성 기준값: 최근 업로드 CSV의 마지막 BASE_ROWS행 평균
-    feature_base = {}
-    latest = _load_latest()
-    if latest:
-        recent = latest[2][-BASE_ROWS:]
-        for col in FEATURES:
-            feature_base[col] = round(sum(r[col] for r in recent) / len(recent), 3)
-
     return {
         "seq_len": INPUT_LEN,  # 대시보드가 /predict 입력·배치 길이로 쓰는 값 (API 입력 길이)
         "features": FEATURES,
         "target": TARGET_FIELD,
-        "feature_base": feature_base,
         "rmse_gate": c.get("RMSE_GATE"),
         "drift_window_size": WINDOW_SIZE,
         "drift_rmse_threshold": RMSE_THRESHOLD,

@@ -10,7 +10,7 @@ LSTM은 최근 SEQ_LEN시간의 사용량 변화율을 입력받는다. 변화�
 필요하므로 /predict는 INPUT_LEN(= SEQ_LEN + 1)개 시퀀스를 요청 본문으로 받는다 (kWh → 변화율 변환은 model_loader).
 길이(INPUT_LEN)와 값 범위를 스키마 단에서 검증해, 학습 시점 입력(data/features.py)과 어긋나지 않게 한다.
 """
-from pydantic import BaseModel, Field, PositiveFloat
+from pydantic import BaseModel, Field
 
 from data.features import SEQ_LEN
 
@@ -41,10 +41,10 @@ class PredictResponse(BaseModel):
 
 
 class BatchTestRequest(BaseModel):
-    # 드리프트 시뮬레이션용. INPUT_LEN + N개의 연속된 사용량을 보내면 서버가 슬라이딩 윈도우로
-    # 잘라 N건을 연속 예측한다. (습도·온도는 시뮬레이션이므로 routers/predict.py의 고정값 사용)
-    # 드리프트 판정이 실제값 대비 오차율(%)이라 0 이하 값은 받지 않는다.
-    energy_series: list[PositiveFloat] = Field(..., min_length=INPUT_LEN + 1)
+    # 드리프트 시뮬레이션용. INPUT_LEN + N개의 연속된 측정값을 보내면 서버가 슬라이딩 윈도우로
+    # 잘라 N건을 연속 예측한다. (대시보드·simulate_drift.py는 GET /data/sample의 실제 측정값을 보냄)
+    # 드리프트 판정이 실제값 대비 오차율(%)이라 energy_kwh는 0 이하를 받지 않는다 (HourlyPoint gt=0).
+    sequence: list[HourlyPoint] = Field(..., min_length=INPUT_LEN + 1)
 
 
 class BatchTestResponse(BaseModel):

@@ -32,10 +32,10 @@ uvicorn serving_app.main:app --host 0.0.0.0 --port 8077
 대시보드 `http://localhost:8077/`, API 문서 `http://localhost:8077/docs`.
 모델을 MLflow에서 불러올 때는 `MODEL_SOURCE=mlflow`, 서버 시작 시 바로 불러올 때는 `LOADING_MODE=eager`를 붙인다.
 
-모델 준비 (최초 1회, 대시보드에서 `data/hourly_clean.csv`를 업로드한 뒤):
+모델 준비: `MODEL_SOURCE=local`(기본)은 repo에 포함된 `serving_app/models/energy_lstm.pt` 번들을 바로 쓴다.
+MLflow 등록이 필요하면 (split CSV `data/train.csv`·`valid.csv`·`test.csv` 필요):
 
 ```bash
-python scripts/train_baseline_v1.py        # scaler.pkl, power_v1.keras 생성 (MODEL_SOURCE=local용)
 python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시 Production 승격
 ```
 
@@ -50,19 +50,21 @@ python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시
 | 데이터 | CSV 업로드, 데이터셋 통계, 데이터 출처 |
 | 시스템 | 서버 설정값, 운영 로그 조회 |
 
-- 드리프트 배치: 정상 배치와 같은 랜덤워크로 만들되 변동성(σ)을 6배로 키워 강제로 드리프트를 일으킨다.
-- 드리프트 판정: 최근 `WINDOW_SIZE`건 예측의 오차율 RMSE(%)가 `RMSE_THRESHOLD`(5%)를 넘으면 드리프트. 정상 배치 약 1.2%, 드리프트 배치 약 7.1%.
-- 입력 길이, 판정 윈도우, 입력 피처, 기준값은 `/system/info`에서 받는다. 화면 코드는 상수를 따로 갖지 않는다.
+- 예시 입력·배치: `/data/sample`로 최근 업로드 CSV의 마지막 구간 실제 측정값을 받는다. 재학습도 같은 파일의 마지막 구간을 쓴다.
+- 드리프트 배치: 정상 배치와 같은 실제 구간의 사용량에 시간별 곱셈 노이즈(σ=0.07)를 섞어 드리프트를 일으킨다. 습도·온도는 실제 값 그대로.
+- 드리프트 판정: 최근 `WINDOW_SIZE`건 예측의 오차율 RMSE(%)가 `RMSE_THRESHOLD`(5%)를 넘으면 드리프트. 정상 배치 약 1.5%, 드리프트 배치 약 6~15%.
+- 입력 길이, 판정 윈도우, 입력 피처는 `/system/info`에서 받는다. 화면 코드는 상수를 따로 갖지 않는다.
 
 ## API
 
 | Method | URL | 역할 |
 | --- | --- | --- |
-| POST | `/predict` | `{"sequence": [{"energy_kwh", "humi_pct", "temp_F"} × SEQ_LEN]}` → `{"predicted_energy_kwh", "model_version"}` |
-| POST | `/predict/batch-test` | `{"energy_series": [SEQ_LEN + N개]}` → N건 예측 + 드리프트 판정 |
+| POST | `/predict` | `{"sequence": [{"energy_kwh", "humi_pct", "temp_F"} × INPUT_LEN]}` → `{"predicted_energy_kwh", "model_version"}` |
+| POST | `/predict/batch-test` | `{"sequence": [{"energy_kwh", "humi_pct", "temp_F"} × (INPUT_LEN + N)]}` → N건 예측 + 드리프트 판정 |
 | GET | `/health` | 서버·모델 준비 상태 |
 | POST | `/data/upload` | CSV 업로드 (필수 컬럼 위 표, 측정값 완전 행 SEQ_LEN + WINDOW_SIZE 이상) |
 | GET | `/data/status` | 최신 업로드 요약 |
+| GET | `/data/sample` | 최신 업로드의 마지막 `rows`시간 실제 측정값 (`drift=true`면 사용량에 노이즈) |
 | GET | `/logs`, `/logs/{파일명}` | 로그 파일 조회 |
 | GET | `/system/info` | 설정값 (입력 길이, 피처, 게이트, 판정 윈도우, 임계값, epoch, 학습률, 환경 변수) |
 | GET | `/system/timeseries` | 예측 요청 로그 구간별 집계 (`window_sec`, `buckets`) |
@@ -94,18 +96,19 @@ python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시
    `TIME_COL`, `EnergyScaler`, `tensors_from_rows`), `SEQ_LEN = 24`, 3피처 스케일러
 2. `serving_app/lstm_model.py` — `N_FEATURES = 3`, PyTorch `LSTMRegressor`
 3. `serving_app/model_loader.py` — `predict_one(sequence)` 계약:
-   - 입력: `[{"energy_relative_pct": float, "humi_pct": float, "temp_F": float}, ...]` (SEQ_LEN개)
-   - 출력: 변화율 raw 스칼라 (kWh 역변환은 서빙팀)
+   - 입력: `[{"energy_kwh": float, "humi_pct": float, "temp_F": float}, ...]` (`INPUT_LEN` = SEQ_LEN + 1개)
+   - 내부: kWh → 직전 대비 변화율(%) SEQ_LEN개 → 모델 → `inverse_y` → 변화율을 마지막 kWh에 적용
+   - 출력: 다음 1시간 `energy_kwh` 예측값 (kWh)
    - `MLFLOW_MODEL_URI` = `models:/GIGA_Energy_LSTM/Production` (`MODEL_NAME`과 일치)
 4. `serving_app/train_and_register.py`
    - `MODEL_NAME = "GIGA_Energy_LSTM"`, epoch 상수 유지
    - `RMSE_GATE = None` (변화율 기준 게이트 미확정 — 데이터 확정 후 팀 합의)
 5. `serving_app/monitoring/drift_detector.py`
-   - `RMSE_THRESHOLD = None` (게이트와 함께 확정 예정), `WINDOW_SIZE = 21` 유지
+   - 오차율(%) RMSE, `RMSE_THRESHOLD = 5.0`, `WINDOW_SIZE = 24`
 6. `serving_app/monitoring/retrain_trigger.py`
    - `WINDOW_SIZE` 상수 사용, 로그 모델명 `MODEL_NAME` 연동
    - 최근 행 조회는 `read_complete_rows` (에너지 컬럼) 경유
 7. `scripts/simulate_drift.py`
-   - `energy_series` 요청 필드 반영, `BATCH_N = SEQ_LEN + WINDOW_SIZE`
-   - 빌드용 시드 CSV 교체(`sample_haic_prices.csv` → 전력 데이터)는 데이터셋 담당과 협의 필요
+   - `energy_series` 요청 필드 반영, `BATCH_N = INPUT_LEN + WINDOW_SIZE`
+   - 빌드용 시드 CSV는 `data/hourly_clean.csv` (`sample_haic_prices.csv` 삭제)
    - baseline 스크립트(`train_baseline_v1.py`)는 삭제 — baseline `.pt`는 노트북 산출물
