@@ -170,7 +170,12 @@ def _register_if_gate_passed(model, run_id: str, score: float, X_example) -> dic
     import mlflow.pytorch as mlflow_pytorch
     from mlflow.tracking import MlflowClient
 
-    mlflow_pytorch.log_model(model, name="model", input_example=X_example)
+    # mlflow 3.x 기본 pt2 직렬화는 TensorSpec 서명을 요구하므로 pickle 사용
+    # (Tensor 변환은 올바른 dtype 추론용으로 유지)
+    ex = X_example
+    if isinstance(ex, np.ndarray):
+        ex = torch.from_numpy(np.ascontiguousarray(ex, dtype=np.float32))
+    mlflow_pytorch.log_model(model, name="model", input_example=ex, serialization_format="pickle")
     result = {"run_id": run_id, "rmse": score, "promoted": False}
     if RMSE_GATE is None:
         print(f"[GATE PENDING] rmse={score:.4f} -> 게이트 미확정(변화율 타깃 확정 후 설정)")
@@ -251,14 +256,15 @@ def fine_tune(rows=None, recent_frac: float | None = None) -> dict:
     set_seed(SEED)
     scaler = load_scaler()
     if rows is not None:
-        try:
-            from data.features import tensors_from_rows
+        # 최근 행만으로 재학습: split 파일 없이 rows 자체를 train/valid로 나눈다.
+        # (서버 환경에 train.csv가 없어도 동작해야 하므로 _load_tensors를 쓰지 않는다)
+        from data.features import tensors_from_rows
 
-            Xtr, ytr = tensors_from_rows(rows, scaler)
-            (Xva, yva, _), (Xte, yte, _) = _load_tensors(scaler)[1:]
-        except (ImportError, AttributeError):
-            print("[WARN] tensors_from_rows 미제공 → split tail로 대체 (데이터셋 담당 확인 요망)")
-            rows = None
+        X_all, y_all = tensors_from_rows(rows, scaler)
+        cut = max(1, int(len(X_all) * 0.7))
+        Xtr, ytr = X_all[:cut], y_all[:cut]
+        Xva, yva = X_all[cut:], y_all[cut:]
+        Xte, yte = Xva, yva  # rows 모드의 test 평가는 valid로 대체 (리포트용)
     if rows is None:
         (Xtr, ytr, _), (Xva, yva, _), (Xte, yte, _) = _load_tensors(scaler)
         if recent_frac is not None:
