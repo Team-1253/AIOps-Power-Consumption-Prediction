@@ -202,6 +202,21 @@
   .readout .ro-meta { display: flex; gap: 8px; flex-wrap: wrap; font-size: 12px; }
   .readout.peak { background: var(--danger); color: var(--text); }
   .readout.peak .ro-label { color: var(--text); }
+  .peak-banner {
+    display: none; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 12px 16px; border-radius: 8px;
+    background: var(--danger); color: var(--text); border: 1px solid #E03131;
+  }
+  .peak-banner.show { display: flex; }
+  .peak-banner svg { width: 24px; height: 24px; flex: none; }
+  .peak-banner .pb-title { font-size: 15px; font-weight: 800; }
+  .peak-banner .pb-detail { font-size: 13px; }
+  .peak-banner .btn { margin-left: auto; border-color: var(--text); }
+  .threshold-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; color: var(--muted); }
+  .threshold-row input[type="number"] {
+    width: 110px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line-strong);
+    background: var(--text); color: var(--ink); font: inherit; font-weight: 700; font-variant-numeric: tabular-nums;
+  }
   .status-line { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
   .file-input { color: var(--muted); font: inherit; font-size: 13px; }
   .file-input::file-selector-button {
@@ -315,6 +330,8 @@
         <button class="btn" onclick="switchTab('ai')"><svg><use href="#i-wave"/></svg>처리 단계 보기</button>
       </div>
 
+      <div class="peak-banner" id="peak-banner" role="alert" aria-live="assertive"></div>
+
       <div class="grid g-3">
         <!-- 예측 실행 -->
         <div class="panel">
@@ -328,6 +345,12 @@
           <div class="btn-row">
             <button class="btn" onclick="regenerateSample()"><svg><use href="#i-refresh"/></svg>예시 데이터 생성</button>
             <button class="btn primary" onclick="runPredict()"><svg><use href="#i-play"/></svg>예측 실행</button>
+          </div>
+          <div class="threshold-row">
+            <label for="peak-input">피크 경보 기준</label>
+            <input type="number" id="peak-input" min="0" step="10" inputmode="decimal" aria-label="피크 경보 기준 (kWh)">
+            <span>kWh 이상</span>
+            <label class="check"><input type="checkbox" id="peak-sound" checked> 경보음</label>
           </div>
           <div class="readout" id="predict-readout"></div>
           <div class="result" id="predict-result"></div>
@@ -552,7 +575,9 @@ const FIELD = {
   batchSeries: "energy_series",            // /predict/batch-test 요청: 사용량 목록
 };
 const LABELS = { energy_kwh: "전력 사용량 (kWh)", humi_pct: "외기 습도 (%)", temp_F: "외기 온도 (°F)" };
-const DEFAULTS = { seqLen: 20, windowSize: 21, baseValue: 1580, driftThreshold: null, rmseGate: null, peakThreshold: null };
+// peakThreshold: 예측값이 이 값 이상이면 피크 경보. 기본 3,000 kWh = 최근 1년(2024-08-29 ~ 2025-08-29) 사용량 상위 5%(2,983 kWh) 근처.
+// 화면 입력값 > /system/info peak_threshold > 이 기본값 순서로 적용한다.
+const DEFAULTS = { seqLen: 20, windowSize: 21, baseValue: 1580, driftThreshold: null, rmseGate: null, peakThreshold: 3000 };
 const UNIT = "kWh";
 
 /* ===================== 전역 상태 ===================== */
@@ -590,7 +615,11 @@ const cfg = {
   baseValue: () => cfg.featureBase(cfg.target()) || DEFAULTS.baseValue,
   driftThreshold: () => (CONFIG && CONFIG.drift_rmse_threshold != null ? CONFIG.drift_rmse_threshold : DEFAULTS.driftThreshold),
   rmseGate: () => (CONFIG && CONFIG.rmse_gate != null ? CONFIG.rmse_gate : DEFAULTS.rmseGate),
-  peakThreshold: () => (CONFIG && CONFIG.peak_threshold != null ? CONFIG.peak_threshold : DEFAULTS.peakThreshold),
+  peakThreshold: () => {
+    const v = parseFloat(document.getElementById("peak-input").value);
+    if (Number.isFinite(v) && v > 0) return v;
+    return CONFIG && CONFIG.peak_threshold != null ? CONFIG.peak_threshold : DEFAULTS.peakThreshold;
+  },
 };
 
 /* ===================== 유틸 ===================== */
@@ -708,7 +737,7 @@ async function loadSystemInfo() {
     ["MODEL_SOURCE", data.model_source],
     ["LOADING_MODE", data.loading_mode],
   ];
-  rows.splice(6, 0, [`피크 경보 기준 (${UNIT})`, data.peak_threshold ?? "미설정"]);
+  rows.splice(6, 0, [`피크 경보 기준 (${UNIT} 이상)`, data.peak_threshold ?? `${DEFAULTS.peakThreshold} (화면 기본값)`]);
   el.innerHTML = kvHtml(rows.map(([l, v]) => [l, v ?? "-"]));
 }
 
@@ -821,7 +850,7 @@ async function loadModelHistory() {
 /* ===================== 최근 알람 ===================== */
 function alertKind(a) {
   const msg = String(a.message || "");
-  if (a.level === "ERROR" || a.level === "CRITICAL") return { cls: "err", icon: "i-err" };
+  if (a.level === "ERROR" || a.level === "CRITICAL" || a.level === "PEAK") return { cls: "err", icon: "i-err" };
   if (a.level === "WARNING" || msg.includes("[WARN]")) return { cls: "warn", icon: "i-warn" };
   if (msg.includes("[OK]")) return { cls: "ok", icon: "i-ok" };
   return { cls: "", icon: "i-info" };
@@ -829,11 +858,12 @@ function alertKind(a) {
 async function loadAlerts() {
   const { ok, data } = await getJSON(`${API.alerts}?limit=20`);
   const el = document.getElementById("alerts-list");
-  if (!ok || !Array.isArray(data) || !data.length) {
+  const items = [...peakAlarms, ...(ok && Array.isArray(data) ? data : [])].sort((a, b) => b.ts - a.ts).slice(0, 20);
+  if (!items.length) {
     el.innerHTML = `<div class="empty">알람 없음</div>`;
     return;
   }
-  el.innerHTML = data.map((a) => {
+  el.innerHTML = items.map((a) => {
     const k = alertKind(a);
     return `
       <div class="alert-row ${k.cls}">
@@ -917,7 +947,7 @@ function renderReadout(data) {
   const box = document.getElementById("predict-readout");
   const value = predictedValue(data);
   const threshold = cfg.peakThreshold();
-  const peak = data[FIELD.peakAlert] != null ? !!data[FIELD.peakAlert] : (value != null && threshold != null && value > threshold);
+  const peak = data[FIELD.peakAlert] != null ? !!data[FIELD.peakAlert] : (value != null && threshold != null && value >= threshold);
   const peakText = peak ? "피크 경보" : (threshold != null ? "피크 경보 없음" : "");
   box.className = `readout show ${peak ? "peak" : ""}`;
   box.innerHTML = `
@@ -928,6 +958,47 @@ function renderReadout(data) {
       ${threshold != null ? `<span>피크 기준 ${fmtKwh(threshold, 1)}</span>` : ""}
       ${peakText ? `<b>${peakText}</b>` : ""}
     </div>`;
+  if (peak) raisePeakAlarm(value, threshold, data.model_version);
+}
+
+/* ===================== 피크 경보 ===================== */
+const peakAlarms = []; // 화면에서 발생한 피크 경보 (최근 알람 목록에 서버 기록과 함께 표시)
+function raisePeakAlarm(value, threshold, version) {
+  const ts = Date.now() / 1000;
+  const time = new Date(ts * 1000).toLocaleTimeString("ko-KR", { hour12: false });
+  const banner = document.getElementById("peak-banner");
+  banner.innerHTML = `
+    ${icon("i-warn")}
+    <div>
+      <div class="pb-title">피크 경보 · 다음 1시간 예측 ${fmtKwh(value, 1)}</div>
+      <div class="pb-detail">기준 ${fmtKwh(threshold, 1)} 이상 · 초과 ${fmtKwh(value - threshold, 1)} · 모델 ${esc(version ?? "-")} · ${time}</div>
+    </div>
+    <button class="btn" onclick="ackPeakAlarm()">확인</button>`;
+  banner.classList.add("show");
+  peakAlarms.unshift({ ts, level: "PEAK", message: `[PEAK] predicted ${fmtNum(value, 1)} kWh >= threshold ${fmtNum(threshold, 1)} kWh` });
+  if (peakAlarms.length > 20) peakAlarms.pop();
+  loadAlerts();
+  if (document.getElementById("peak-sound").checked) playAlarmTone();
+}
+function ackPeakAlarm() {
+  document.getElementById("peak-banner").classList.remove("show");
+}
+// 짧은 2음 경보 3회. 예측 실행 버튼 클릭 직후 호출되므로 브라우저 자동재생 제한에 걸리지 않는다.
+function playAlarmTone() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    for (let i = 0; i < 6; i++) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "square";
+      osc.frequency.value = i % 2 ? 660 : 880;
+      gain.gain.value = 0.06;
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(ctx.currentTime + i * 0.18);
+      osc.stop(ctx.currentTime + i * 0.18 + 0.14);
+    }
+    setTimeout(() => ctx.close(), 1500);
+  } catch (e) { /* 오디오 미지원 브라우저는 화면 경보만 표시 */ }
 }
 async function runPredict() {
   const input = document.getElementById("predict-input");
@@ -1066,6 +1137,7 @@ async function init() {
   tickClock(); setInterval(tickClock, 1000);
   renderRangeToolbar();
   await loadSystemInfo();
+  document.getElementById("peak-input").value = CONFIG && CONFIG.peak_threshold != null ? CONFIG.peak_threshold : DEFAULTS.peakThreshold;
   regenerateSample();
   renderPipeline();
   loadHealth();
