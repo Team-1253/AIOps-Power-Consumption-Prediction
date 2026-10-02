@@ -343,7 +343,7 @@
           </div>
           <textarea id="predict-input" spellcheck="false" aria-label="예측 입력 JSON"></textarea>
           <div class="btn-row">
-            <button class="btn" onclick="regenerateSample()"><svg><use href="#i-refresh"/></svg>예시 데이터 생성</button>
+            <button class="btn" onclick="loadSample()"><svg><use href="#i-refresh"/></svg>최근 데이터 불러오기</button>
             <button class="btn primary" onclick="runPredict()"><svg><use href="#i-play"/></svg>예측 실행</button>
           </div>
           <div class="threshold-row">
@@ -361,7 +361,7 @@
           <div class="panel-head">
             <div>
               <h2><svg class="ico"><use href="#i-detect"/></svg>배치 주입</h2>
-              <p>정상 배치 · 드리프트 배치(변동성 3배) 생성 후 <code>/predict/batch-test</code> 전송</p>
+              <p>최근 업로드의 실제 측정값으로 정상 배치 · 드리프트 배치(사용량 노이즈) 생성 후 <code>/predict/batch-test</code> 전송</p>
             </div>
           </div>
           <div class="btn-row" style="margin-top:0">
@@ -557,6 +557,7 @@ const API = {
   batch: "/predict/batch-test",
   health: "/health",
   upload: "/data/upload",
+  sample: "/data/sample",
   logs: "/logs",
   systemInfo: "/system/info",
   timeseries: "/system/timeseries",
@@ -572,12 +573,11 @@ const FIELD = {
   target: "energy_kwh",                    // 예측 대상 필드 (/system/info target 우선)
   predicted: "predicted_energy_kwh",       // /predict 응답: 예측값
   peakAlert: "peak_alert",                 // /predict 응답: 피크 경보 여부 (없으면 화면에서 기준값과 비교)
-  batchSeries: "energy_series",            // /predict/batch-test 요청: 사용량 목록
 };
 const LABELS = { energy_kwh: "전력 사용량 (kWh)", humi_pct: "외기 습도 (%)", temp_F: "외기 온도 (°F)" };
 // peakThreshold: 예측값이 이 값 이상이면 피크 경보. 기본 3,000 kWh = 최근 1년(2024-08-29 ~ 2025-08-29) 사용량 상위 5%(2,983 kWh) 근처.
 // 화면 입력값 > /system/info peak_threshold > 이 기본값 순서로 적용한다.
-const DEFAULTS = { seqLen: 20, windowSize: 21, baseValue: 1580, driftThreshold: null, rmseGate: null, peakThreshold: 3000 };
+const DEFAULTS = { seqLen: 20, windowSize: 21, driftThreshold: null, rmseGate: null, peakThreshold: 3000 };
 const UNIT = "kWh";
 
 /* ===================== 전역 상태 ===================== */
@@ -593,8 +593,6 @@ const RANGE_OPTIONS = [
   { label: "6시간", sec: 21600 },
   { label: "24시간", sec: 86400 },
 ];
-const NORMAL_SIGMA = 0.012;
-const DRIFT_SIGMA = NORMAL_SIGMA * 6; // 오차율 약 7%로 드리프트 임계값(5%)을 넘김
 const PIPELINE_STAGES = [
   { title: "데이터 수집", desc: "요청 수신", icon: "i-collect" },
   { title: "데이터 모니터링", desc: "예측 기록 누적", icon: "i-observe" },
@@ -611,8 +609,6 @@ const cfg = {
   windowSize: () => (CONFIG && CONFIG.drift_window_size) || DEFAULTS.windowSize,
   features: () => (CONFIG && Array.isArray(CONFIG.features) && CONFIG.features.length ? CONFIG.features : FIELD.features),
   target: () => (CONFIG && CONFIG.target) || FIELD.target,
-  featureBase: (key) => (CONFIG && CONFIG.feature_base ? CONFIG.feature_base[key] : undefined),
-  baseValue: () => cfg.featureBase(cfg.target()) || DEFAULTS.baseValue,
   driftThreshold: () => (CONFIG && CONFIG.drift_rmse_threshold != null ? CONFIG.drift_rmse_threshold : DEFAULTS.driftThreshold),
   rmseGate: () => (CONFIG && CONFIG.rmse_gate != null ? CONFIG.rmse_gate : DEFAULTS.rmseGate),
   peakThreshold: () => {
@@ -631,18 +627,6 @@ function badge(kind, text, iconId) { return `<span class="badge ${kind}">${iconI
 function fmtNum(v, digits = 1) { return v == null || Number.isNaN(Number(v)) ? "-" : Number(v).toLocaleString("ko-KR", { maximumFractionDigits: digits, minimumFractionDigits: digits }); }
 function fmtKwh(v, digits = 1) { return v == null ? "-" : `${fmtNum(v, digits)} ${UNIT}`; }
 function fmtPct(v, digits = 2) { return v == null ? "-" : `${fmtNum(v, digits)}%`; }
-function randn() {
-  let u = 0, v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-}
-function randomWalk(n, base, sigma) {
-  const out = [];
-  let lv = Math.log(base);
-  for (let i = 0; i < n; i++) { lv += randn() * sigma; out.push(Math.exp(lv)); }
-  return out;
-}
 // 오차율 RMSE(%): 서버 drift_detector.compute_rmse와 같은 식
 function rmseOf(actual, predicted) {
   const n = Math.min(actual.length, predicted.length);
@@ -926,19 +910,16 @@ function stageHtml(stage, idx, state, statusLabel) {
 }
 
 /* ===================== 예측 실행 ===================== */
-// 예측 대상은 기준값에서 시작하는 랜덤워크, 나머지 피처는 기준값(최근 업로드 평균) ±2% 변동
-function roundFor(base, v) { return Math.abs(base) >= 1000 ? Math.round(v) : Math.round(v * 100) / 100; }
-function generateSequence(n) {
-  const target = cfg.target();
-  const walk = randomWalk(n, cfg.baseValue(), NORMAL_SIGMA);
-  return Array.from({ length: n }, (_, i) => Object.fromEntries(cfg.features().map((k) => {
-    if (k === target) return [k, roundFor(walk[i], walk[i])];
-    const base = cfg.featureBase(k) ?? 1;
-    return [k, roundFor(base, base * (1 + 0.02 * randn()))];
-  })));
-}
-function regenerateSample() {
-  document.getElementById("predict-input").value = JSON.stringify({ [FIELD.sequence]: generateSequence(cfg.seqLen()) }, null, 2);
+// 예시 입력: 최근 업로드 CSV의 마지막 seqLen시간 실제 측정값 (GET /data/sample)
+async function loadSample() {
+  const input = document.getElementById("predict-input");
+  const { ok, data } = await getJSON(`${API.sample}?rows=${cfg.seqLen()}`);
+  if (!ok || !data) {
+    input.value = "";
+    input.placeholder = (data && data.detail) || "실제 데이터를 불러오지 못했습니다. CSV를 먼저 업로드하세요.";
+    return;
+  }
+  input.value = JSON.stringify({ [FIELD.sequence]: data.sequence }, null, 2);
 }
 function predictedValue(data) {
   if (data[FIELD.predicted] != null) return data[FIELD.predicted];
@@ -1027,19 +1008,26 @@ async function sendBatch(kind) {
   const buttons = [document.getElementById("btn-normal"), document.getElementById("btn-drift")];
   const seqLen = cfg.seqLen();
   const n = seqLen + cfg.windowSize();
-  const series = randomWalk(n, cfg.baseValue(), kind === "drift" ? DRIFT_SIGMA : NORMAL_SIGMA).map((v) => Math.round(v * 10) / 10);
 
   buttons.forEach((b) => (b.disabled = true));
   statusEl.innerHTML = badge("muted", `${kind === "drift" ? "드리프트" : "정상"} 배치 전송 중 · 재학습 시 수십 초 소요`, "i-clock");
   try {
-    const res = await fetch(API.batch, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ [FIELD.batchSeries]: series }) });
+    // 배치 = 최근 업로드의 마지막 n시간 실제 측정값 (드리프트는 서버가 사용량에 노이즈를 섞어 돌려줌)
+    const sample = await getJSON(`${API.sample}?rows=${n}&drift=${kind === "drift"}`);
+    if (!sample.ok || !sample.data) {
+      statusEl.innerHTML = badge("err", "실제 데이터 조회 실패", "i-err");
+      showResult(resultBox, { status: sample.status, detail: sample.data }, true);
+      return;
+    }
+    const sequence = sample.data.sequence;
+    const res = await fetch(API.batch, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ [FIELD.sequence]: sequence }) });
     const data = await safeJson(res);
     if (!res.ok) {
       statusEl.innerHTML = badge("err", `서버 오류 (HTTP ${res.status})`, "i-err");
       showResult(resultBox, { status: res.status, detail: data }, true);
       return;
     }
-    const actual = series.slice(seqLen);
+    const actual = sequence.slice(seqLen).map((p) => p[cfg.target()]);
     const clientRmse = rmseOf(actual, data.predictions || []);
     lastPipelineRun = { driftCheck: data.drift_check || {}, clientRmse, ts: Date.now() / 1000 };
     if (clientRmse != null) { batchRmseHistory.push(clientRmse); if (batchRmseHistory.length > 12) batchRmseHistory.shift(); }
@@ -1140,7 +1128,7 @@ async function init() {
   renderRangeToolbar();
   await loadSystemInfo();
   document.getElementById("peak-input").value = CONFIG && CONFIG.peak_threshold != null ? CONFIG.peak_threshold : DEFAULTS.peakThreshold;
-  regenerateSample();
+  loadSample();
   renderPipeline();
   loadHealth();
   loadKpis();
