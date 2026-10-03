@@ -6,7 +6,7 @@
 
 ■ 엔드포인트
    POST /predict             : 최근 INPUT_LEN시간 측정값 → 다음 1시간 전력 사용량
-   POST /predict/batch-test  : 연속 사용량 목록 → 슬라이딩 윈도우로 여러 번 예측 → 드리프트 검사
+   POST /predict/batch-test  : 연속 측정값 목록 → 슬라이딩 윈도우로 여러 번 예측 → 드리프트 검사
 
 ■ 모델과의 약속 (model_loader.LoadedModel.predict_one)
    입력 : [{"energy_kwh": 2750.0, "humi_pct": 41.0, "temp_F": 58.0}, ... INPUT_LEN개]  (오래된 시간 → 최근 시간)
@@ -25,10 +25,6 @@ router = APIRouter()
 # 드리프트 판단은 최근 WINDOW_SIZE건만 보므로 그만큼만 유지한다.
 recent_predictions: list[dict] = []
 
-# 시뮬레이션 배치는 사용량만 보내므로, 습도·온도는 정제 데이터 전체 기간 평균으로 고정한다.
-SIMULATED_HUMI_PCT = 42.3
-SIMULATED_TEMP_F = 53.5
-
 
 @router.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
@@ -46,26 +42,22 @@ def predict(req: PredictRequest):
 @router.post("/predict/batch-test", response_model=BatchTestResponse)
 def batch_test(req: BatchTestRequest):
     """
-    받는 것  : {"energy_series": [2750.0, 2761.2, ... INPUT_LEN + N개]}  (대시보드 배치 주입이 보냄)
+    받는 것  : {"sequence": [{"energy_kwh": ..., "humi_pct": ..., "temp_F": ...}, ... INPUT_LEN + N개]}
+               (대시보드 배치 주입이 GET /data/sample 의 실제 측정값을 보냄)
     돌려줄 것: {"predictions": [예측값 N개], "drift_check": {"status": "ok"} 또는 재학습 결과}
 
     ■ 슬라이딩 윈도우: INPUT_LEN칸 창문을 한 칸씩 밀며 바로 다음 1시간을 예측하고 실제 값과 비교한다.
         i=0 : [e0 ~ e(INPUT_LEN-1)] → 예측  vs  실제 e(INPUT_LEN)
         i=1 : [e1 ~ e(INPUT_LEN)]   → 예측  vs  실제 e(INPUT_LEN+1)
-        → 총 len(energy_series) - INPUT_LEN번 예측
+        → 총 len(sequence) - INPUT_LEN번 예측
     """
     model = model_loader.get_model()
     predictions: list[float] = []
 
-    series = req.energy_series
+    series = [p.model_dump() for p in req.sequence]
     for i in range(len(series) - INPUT_LEN):
-        window = series[i : i + INPUT_LEN]
-        sequence = [
-            {"energy_kwh": e, "humi_pct": SIMULATED_HUMI_PCT, "temp_F": SIMULATED_TEMP_F}
-            for e in window
-        ]
-        pred = model.predict_one(sequence)
-        actual = series[i + INPUT_LEN]
+        pred = model.predict_one(series[i : i + INPUT_LEN])
+        actual = series[i + INPUT_LEN]["energy_kwh"]
         predictions.append(pred)
         recent_predictions.append({"predicted": pred, "actual": actual})
 
