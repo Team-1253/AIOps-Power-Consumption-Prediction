@@ -213,6 +213,18 @@ def _save_local(model, scaler, feature_cols, target_col, seq_len) -> None:
     print(f"saved -> {LOCAL_MODEL_PATH}")
 
 
+def _save_if_promoted(out: dict, model, scaler, feature_cols, target_col, seq_len) -> bool:
+    """게이트 통과(promoted)시에만 로컬 번들을 교체한다.
+
+    RMSE_GATE=None이면 promoted가 될 수 없어 로컬 번들은 절대 바뀌지 않는다.
+    """
+    if out.get("promoted"):
+        _save_local(model, scaler, feature_cols, target_col, seq_len)
+        return True
+    print(f"[GATE BLOCKED] rmse={out.get('rmse'):.4f} -> 로컬 번들 유지 ({LOCAL_MODEL_PATH})")
+    return False
+
+
 def train_and_register() -> dict:
     """처음부터(scratch) 학습. base 학습에서만 사용."""
     import mlflow
@@ -237,13 +249,13 @@ def train_and_register() -> dict:
         mlflow.log_metric("best_val_rmse", stats["best_val_rmse"])
         mlflow.log_metric("test_rmse", test_rmse)
         mlflow.log_metric("test_mae", test_mae)
-        _save_local(model, scaler, FEATURE_COLS, TARGET_COL, Xtr.shape[1])
 
         # 게이트는 validation 기준. test split은 고정 홀드아웃이라 반복 승격 기준으로
         # 쓰면 test에 과적합된다. test 수치는 최종 리포트용으로만 기록한다.
         out = _register_if_gate_passed(
             model, mlflow.active_run().info.run_id, stats["best_val_rmse"], Xtr[:1]
         )
+        _save_if_promoted(out, model, scaler, FEATURE_COLS, TARGET_COL, Xtr.shape[1])
         out["test_rmse"] = test_rmse
         out["test_mae"] = test_mae
         return out
@@ -302,12 +314,12 @@ def fine_tune(rows=None, recent_frac: float | None = None) -> dict:
         mlflow.log_param("n_train", len(Xtr))
         mlflow.log_metric("test_rmse", test_rmse)
         mlflow.log_metric("test_mae", test_mae)
-        _save_local(model, scaler, FEATURE_COLS, TARGET_COL, Xtr.shape[1])
 
         # base와 동일: 게이트는 validation 기준 (rows 모드의 valid 포함).
         out = _register_if_gate_passed(
             model, mlflow.active_run().info.run_id, stats["best_val_rmse"], Xtr[:1]
         )
+        _save_if_promoted(out, model, scaler, FEATURE_COLS, TARGET_COL, Xtr.shape[1])
         out["test_rmse"] = test_rmse
         out["test_mae"] = test_mae
         return out
