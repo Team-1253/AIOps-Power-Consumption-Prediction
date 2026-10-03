@@ -1147,7 +1147,7 @@ async function postBatch(sequence, statusEl, resultBox) {
   loadKpis(); loadAlerts(); loadModelCurrent(); loadModelHistory(); loadMetricsSummary(); loadHealth();
 
   const check = data.drift_check || {};
-  const serverRmse = check.rmse != null ? fmtKwh(check.rmse, 2) : "-";
+  const serverRmse = check.rmse != null ? fmtPct(check.rmse, 2) : "-";
   let line;
   if (check.status === "retrain_triggered" && check.promoted) line = badge("warn", `드리프트 감지 · 재학습 완료 · 새 버전 승격 (재학습 RMSE ${serverRmse})`, "i-warn");
   else if (check.status === "retrain_triggered" && check.promoted === false) line = badge("err", `드리프트 감지 · 게이트 미통과 · 기존 버전 유지 (재학습 RMSE ${serverRmse})`, "i-err");

@@ -111,7 +111,9 @@ python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시
    - `MLFLOW_MODEL_URI` = `models:/GIGA_Energy_LSTM/Production` (`MODEL_NAME`과 일치)
 4. `serving_app/train_and_register.py`
    - `MODEL_NAME = "GIGA_Energy_LSTM"`, epoch 상수 유지
-   - `RMSE_GATE = 4.5` (baseline best-val 4.21 기준)
+   - `RMSE_GATE = 4.5` (base 학습용, 상대변화율 RMSE. baseline best-val 4.21 기준)
+   - `FINE_TUNE_PCT_GATE = 4.0` (재학습용, kWh 공간 오차율(%). 드리프트 임계 5%보다 낮게 잡아
+     승격이 곧 재요청 판정 통과를 의미하게 한다. 통과시에만 로컬 번들 교체)
 5. `serving_app/monitoring/drift_detector.py`
    - 오차율(%) RMSE, `RMSE_THRESHOLD = 5.0`, `WINDOW_SIZE = 24`
 6. `serving_app/monitoring/retrain_trigger.py`
