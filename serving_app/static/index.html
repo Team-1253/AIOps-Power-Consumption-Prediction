@@ -772,7 +772,7 @@ async function loadModelCurrent() {
   if (data.source === "local") {
     panel.innerHTML = `
       <div class="model-name">${esc(data.version)}</div>
-      <div class="kv-row"><span class="k">소스</span><span class="v">로컬 (.keras)</span></div>
+      <div class="kv-row"><span class="k">소스</span><span class="v">로컬 (.pt)</span></div>
       <div class="kv-row"><span class="k">구분</span><span class="v">baseline</span></div>`;
     pill.outerHTML = `<span class="badge muted" id="model-health">${icon("i-ok")}로컬</span>`;
     return;

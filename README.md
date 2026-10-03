@@ -32,10 +32,12 @@ uvicorn serving_app.main:app --host 0.0.0.0 --port 8077
 대시보드 `http://localhost:8077/`, API 문서 `http://localhost:8077/docs`.
 모델을 MLflow에서 불러올 때는 `MODEL_SOURCE=mlflow`, 서버 시작 시 바로 불러올 때는 `LOADING_MODE=eager`를 붙인다.
 
-모델 준비 (최초 1회, 대시보드에서 `data/hourly_clean.csv`를 업로드한 뒤):
+모델 준비 (최초 1회, 노트북에서 baseline 생성):
 
 ```bash
-python scripts/train_baseline_v1.py        # scaler.pkl, power_v1.keras 생성 (MODEL_SOURCE=local용)
+# notebooks/gigatime_LSTM_ML.ipynb 전체 실행
+# → notebooks/factory_energy_lstm.pt, notebooks/scaler.pkl 생성
+# → serving_app/models/factory_energy_lstm.pt, serving_app/models/scaler.pkl로 반영
 python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시 Production 승격
 ```
 
@@ -58,8 +60,8 @@ python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시
 
 | Method | URL | 역할 |
 | --- | --- | --- |
-| POST | `/predict` | `{"sequence": [{"energy_kwh", "humi_pct", "temp_F"} × SEQ_LEN]}` → `{"predicted_energy_kwh", "model_version"}` |
-| POST | `/predict/batch-test` | `{"energy_series": [SEQ_LEN + N개]}` → N건 예측 + 드리프트 판정 |
+| POST | `/predict` | `{"sequence": [{"energy_kwh", "humi_pct", "temp_F"} × 25 (SEQ_LEN+1)]}` → `{"predicted_energy_kwh", "model_version"}` |
+| POST | `/predict/batch-test` | `{"energy_series": [SEQ_LEN+1 + N개]}` → N건 예측 + 드리프트 판정 |
 | GET | `/health` | 서버·모델 준비 상태 |
 | POST | `/data/upload` | CSV 업로드 (필수 컬럼 위 표, 측정값 완전 행 SEQ_LEN + WINDOW_SIZE 이상) |
 | GET | `/data/status` | 최신 업로드 요약 |

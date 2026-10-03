@@ -1,14 +1,12 @@
 """
 공장 전력사용량 1시간 후 예측용 LSTM 아키텍처 (baseline 학습과 MLflow 학습이 공유).
 
-노트북 `gigatime_LSTM_ML.ipynb` Cell 14 (LSTMRegressor)를 그대로 이식한 PyTorch 버전.
-입력: 과거 24시간 x [temp, humidity, energy] (24, 3), 출력: 다음 1시간 타깃 스칼라 1개.
-※ 타깃이 수치 → 변화율로 변경 중(데이터셋 담당). 회귀 구조는 동일하므로 head/loss는
-그대로 두고, 변화율 컬럼명·역변환식은 데이터 확정 후 반영한다.
+노트북 `gigatime_LSTM_ML.ipynb`의 LSTMRegressor와 동일 규격.
+입력: 과거 24시간 x [temp_F, humi_pct, energy_relative_pct] (24, 3),
+출력: 다음 1시간 변화율 스칼라 1개. 하이퍼파라미터(hidden 64, 2층,
+dropout 0.2, head 64→32→1)도 노트북과 같다.
 
-장치 우선순위: cuda → xpu(Intel Arc) → cpu. (노트북 Cell 4 로직)
-XPU 학습 시 OOM 회피: Adam(foreach=False) + batch 64 + empty_cache는
-train_and_register.py 쪽에서 처리한다.
+기준 실행 환경은 CPU다.
 """
 
 import random
@@ -19,9 +17,7 @@ import torch.nn as nn
 
 SEED = 42
 
-# 입력 shape 기본값 (single source of truth — 다른 모듈은 여기서 import해서 쓸 것).
-# 값 미확정(PENDING): SEQ_LEN/N_FEATURES 최종값은 데이터셋 담당 확정 후 반영.
-# (현재 lag 데이터셋 기준: lag_24h..lag_1h x [temp_F, humi_pct, energy_relative_pct])
+# 입력 shape (노트북 baseline과 동일: lag_24h..lag_1h x [temp_F, humi_pct, energy_relative_pct]).
 SEQ_LEN = 24
 N_FEATURES = 3
 
@@ -33,10 +29,6 @@ def set_seed(seed: int = SEED) -> None:
 
 
 def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        return torch.device("xpu")
     return torch.device("cpu")
 
 

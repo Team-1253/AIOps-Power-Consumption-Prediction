@@ -1,11 +1,12 @@
 """
 드리프트 감지  —  serving_app/monitoring/drift_detector.py
 """
+
 # RMSE는 kWh가 아니라 오차율(%)로 계산한다. 사용량 수준이 해마다 크게 달라도 같은 기준을 쓰기 위해서다.
 # 대시보드 배치(시간당 변동성 1.2%)를 "직전 값 그대로" 예측하면 정상 배치 약 1.2%,
 # 드리프트 배치(변동성 6배) 약 7.1%가 나온다.
 RMSE_THRESHOLD = 5.0  # %. 이보다 많이 틀리면 드리프트
-WINDOW_SIZE = 24       # 최근 24건(하루치)을 봅니다
+WINDOW_SIZE = 24  # 최근 24건(하루치)을 봅니다
 
 
 def compute_rmse(recent_predictions: list[dict]) -> float:
@@ -18,8 +19,11 @@ def compute_rmse(recent_predictions: list[dict]) -> float:
     # 기록이 하나도 없으면 0.0 (빈 목록이면 평균을 낼 때 0으로 나누기 에러가 나기 때문)
     if not recent_predictions:
         return 0.0
-    
-    errors_sq = [((p["actual"] - p["predicted"]) / p["actual"] * 100) ** 2 for p in recent_predictions]
+
+    errors_sq = [
+        ((p["actual"] - p["predicted"]) / p["actual"] * 100) ** 2
+        for p in recent_predictions
+    ]
     return math.sqrt(sum(errors_sq) / len(errors_sq))
 
 
