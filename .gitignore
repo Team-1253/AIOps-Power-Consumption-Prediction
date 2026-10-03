@@ -14,6 +14,8 @@ requests.log
 data/uploads/*.csv
 serving_app/models/*.keras
 serving_app/models/*.pkl
+serving_app/models/*.bak
+notebooks/data/*.csv
 
 # OS / 편집기
 .DS_Store

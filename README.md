@@ -32,8 +32,17 @@ uvicorn serving_app.main:app --host 0.0.0.0 --port 8077
 대시보드 `http://localhost:8077/`, API 문서 `http://localhost:8077/docs`.
 모델을 MLflow에서 불러올 때는 `MODEL_SOURCE=mlflow`, 서버 시작 시 바로 불러올 때는 `LOADING_MODE=eager`를 붙인다.
 
-모델 준비: `MODEL_SOURCE=local`(기본)은 repo에 포함된 `serving_app/models/energy_lstm.pt` 번들을 바로 쓴다.
-MLflow 등록이 필요하면 (split CSV `data/train.csv`·`valid.csv`·`test.csv` 필요):
+모델 준비 (최초 1회, 노트북에서 baseline 생성):
+
+```bash
+# notebooks/gigatime_LSTM_ML.ipynb 전체 실행
+# → notebooks/factory_energy_lstm.pt, notebooks/scaler.pkl 생성
+# → serving_app/models/factory_energy_lstm.pt, serving_app/models/scaler.pkl로 반영
+```
+
+`MODEL_SOURCE=local`(기본)은 repo에 포함된 번들을 바로 쓴다.
+학습 split CSV(`notebooks/data/train.csv`·`valid.csv`·`test.csv`)는 로컬 보관으로 repo에 포함되지 않는다.
+MLflow 등록이 필요하면 (위 split CSV 필요):
 
 ```bash
 python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시 Production 승격
@@ -82,7 +91,7 @@ python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시
 
 백엔드 · 프론트엔드
 
-- `serving_app/schemas.py`: 요청·응답 필드를 CSV 컬럼명으로 변경 (`HourlyPoint`, `predicted_energy_kwh`, `energy_series`)
+- `serving_app/schemas.py`: 요청·응답 필드를 CSV 컬럼명으로 변경 (`HourlyPoint`, `predicted_energy_kwh`, `sequence`)
 - `serving_app/routers/predict.py`, `data.py`: 새 필드명, 업로드 검증, 판정 윈도우 상수 사용
 - `serving_app/routers/system.py`, `models.py`, `metrics.py`, `serving_app/monitoring/logger.py`: 대시보드용 조회 API 추가
 - `data/storage.py`: 대시보드 통계·업로드 검증용 CSV 읽기 함수(`read_complete_rows`) 추가
@@ -102,13 +111,13 @@ python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시
    - `MLFLOW_MODEL_URI` = `models:/GIGA_Energy_LSTM/Production` (`MODEL_NAME`과 일치)
 4. `serving_app/train_and_register.py`
    - `MODEL_NAME = "GIGA_Energy_LSTM"`, epoch 상수 유지
-   - `RMSE_GATE = None` (변화율 기준 게이트 미확정 — 데이터 확정 후 팀 합의)
+   - `RMSE_GATE = 4.5` (baseline best-val 4.21 기준)
 5. `serving_app/monitoring/drift_detector.py`
    - 오차율(%) RMSE, `RMSE_THRESHOLD = 5.0`, `WINDOW_SIZE = 24`
 6. `serving_app/monitoring/retrain_trigger.py`
    - `WINDOW_SIZE` 상수 사용, 로그 모델명 `MODEL_NAME` 연동
    - 최근 행 조회는 `read_complete_rows` (에너지 컬럼) 경유
 7. `scripts/simulate_drift.py`
-   - `energy_series` 요청 필드 반영, `BATCH_N = INPUT_LEN + WINDOW_SIZE`
+   - `GET /data/sample`의 실제 측정값을 받아 `sequence`로 전송, `BATCH_N = INPUT_LEN + WINDOW_SIZE`
    - 빌드용 시드 CSV는 `data/hourly_clean.csv` (`sample_haic_prices.csv` 삭제)
    - baseline 스크립트(`train_baseline_v1.py`)는 삭제 — baseline `.pt`는 노트북 산출물
