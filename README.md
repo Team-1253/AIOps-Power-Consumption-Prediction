@@ -4,7 +4,6 @@ AI 데이터센터 전력 수요 예측 서비스 (팀명: 기가(GW) 막힐 땐
 최근 측정값으로 다음 1시간 전력 사용량(kWh)을 예측하는 LSTM 모델을 FastAPI로 서빙하고,
 드리프트 감지 → fine-tuning 재학습 → MLflow 승격까지 대시보드에서 확인한다.
 
-- 기반 코드: SKALA 실습 HAIC 스켈레톤 (`docs/HAIC_skeleton_README.md`)
 - 프로젝트 개요: `docs/프로젝트_개요.md`
 - 데이터: NREL ESIF HPC 데이터센터 실측값을 1시간 단위로 정제한 `data/hourly_clean.csv` (`data/README_dataset.md`)
 
@@ -111,7 +110,9 @@ python serving_app/train_and_register.py   # MLflow 등록, RMSE_GATE 통과 시
    - `MLFLOW_MODEL_URI` = `models:/GIGA_Energy_LSTM/Production` (`MODEL_NAME`과 일치)
 4. `serving_app/train_and_register.py`
    - `MODEL_NAME = "GIGA_Energy_LSTM"`, epoch 상수 유지
-   - `RMSE_GATE = 4.5` (baseline best-val 4.21 기준)
+   - `RMSE_GATE = 4.5` (base 학습용, 상대변화율 RMSE. baseline best-val 4.21 기준)
+   - `FINE_TUNE_PCT_GATE = 4.0` (재학습용, kWh 공간 오차율(%). 드리프트 임계 5%보다 낮게 잡아
+     승격이 곧 재요청 판정 통과를 의미하게 한다. 통과시에만 로컬 번들 교체)
 5. `serving_app/monitoring/drift_detector.py`
    - 오차율(%) RMSE, `RMSE_THRESHOLD = 5.0`, `WINDOW_SIZE = 24`
 6. `serving_app/monitoring/retrain_trigger.py`

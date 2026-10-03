@@ -63,7 +63,7 @@ def check_and_trigger(recent_predictions: list[dict]) -> dict:
     if result["promoted"]:
         model_loader.reset_cache()
         logger.info(
-            f"[OK] new_rmse={result['rmse']:.2f} - production promoted: {MODEL_NAME} v{result['version']}"
+            f"[OK] new_rmse={result['rmse']:.2f}% - production promoted: {MODEL_NAME} v{result['version']}"
         )
         return {"status": "retrain_triggered", "promoted": True, "rmse": result["rmse"]}
     return {"status": "retrain_triggered", "promoted": False, "rmse": result["rmse"]}

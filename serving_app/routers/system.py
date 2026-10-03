@@ -37,7 +37,7 @@ def _train_constants() -> dict:
     모듈을 import하면 torch·mlflow가 같이 올라와 조회 API가 느려지므로,
     소스 파일의 최상위 상수 대입문만 파싱한다.
     """
-    names = {"RMSE_GATE", "MODEL_NAME", "BASE_EPOCHS", "FINE_TUNE_EPOCHS", "FINE_TUNE_LR"}
+    names = {"RMSE_GATE", "FINE_TUNE_PCT_GATE", "MODEL_NAME", "BASE_EPOCHS", "FINE_TUNE_EPOCHS", "FINE_TUNE_LR"}
     with open(TRAIN_SCRIPT, encoding="utf-8") as f:
         tree = ast.parse(f.read())
     found = {}
@@ -74,6 +74,7 @@ def info():
         "features": FEATURES,
         "target": TARGET_FIELD,
         "rmse_gate": c.get("RMSE_GATE"),
+        "fine_tune_pct_gate": c.get("FINE_TUNE_PCT_GATE"),
         "drift_window_size": WINDOW_SIZE,
         "drift_rmse_threshold": RMSE_THRESHOLD,
         "peak_threshold": PEAK_THRESHOLD,

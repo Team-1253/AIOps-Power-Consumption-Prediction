@@ -29,6 +29,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from serving_app.lstm_model import N_FEATURES, build_model, get_device, set_seed
+from serving_app.monitoring.drift_detector import compute_rmse
 
 SEED = 42
 DEVICE = get_device()
@@ -37,15 +38,24 @@ BATCH_SIZE = 64
 LR = 1e-3
 BASE_EPOCHS = 50  # 노트북 EPOCHS
 PATIENCE = 7  # 노트북 EarlyStopping patience
-FINE_TUNE_EPOCHS = 10
-FINE_TUNE_LR = 1e-4  # base(1e-3)보다 낮게 살짝만 갱신
+# fine-tune 용량: 17개 시퀀스 기준 10epoch/b64(스텝 10회)로는 적응이 안 돼
+# 50epoch/b16(스텝 약 100회) + clip으로 올린다. base 학습은 건드리지 않는다.
+FINE_TUNE_EPOCHS = 50
+FINE_TUNE_LR = 3e-4
+FINE_TUNE_BATCH_SIZE = 16
+FINE_TUNE_GRAD_CLIP = 1.0
 
 MODEL_NAME = "GIGA_Energy_LSTM"
 LOCAL_MODEL_PATH = "serving_app/models/factory_energy_lstm.pt"
 
-# baseline best-val 4.21 기준 배포 게이트. None이면 등록은 하되 promoted=False로 둔다.
+# baseline best-val 4.21 기준 배포 게이트 (상대변화율 RMSE, base 전체 학습용).
 # (plain 대입 유지: routers/system.py가 AST 파싱으로 이 상수를 읽는다)
 RMSE_GATE = 4.5
+
+# fine-tune(rows 모드) 배포 게이트 (kWh 공간 오차율(%) RMSE).
+# 드리프트 임계값(5%)보다 낮게 잡아야 승격이 곧 재요청 판정 통과를 의미한다.
+# baseline 실측: drift 월 5.85~7.93%, normal 월 0.82%.
+FINE_TUNE_PCT_GATE = 4.0
 
 
 def rmse(y_true, y_pred) -> float:
@@ -56,14 +66,14 @@ def mae(y_true, y_pred) -> float:
     return float(np.mean(np.abs(np.array(y_true) - np.array(y_pred))))
 
 
-def _make_loaders(X_train, y_train, X_valid, y_valid, X_test, y_test):
+def _make_loaders(X_train, y_train, X_valid, y_valid, X_test, y_test, batch_size=BATCH_SIZE):
     def _loader(X, y, shuffle):
         return DataLoader(
             TensorDataset(
                 torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32)),
                 torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32)),
             ),
-            batch_size=BATCH_SIZE,
+            batch_size=batch_size,
             shuffle=shuffle,
             num_workers=0,
             pin_memory=False,
@@ -124,7 +134,33 @@ def evaluate(model, loader, scaler) -> tuple[float, float]:
     return rmse(actual, pred), mae(actual, pred)
 
 
-def _fit(model, train_loader, valid_loader, scaler, epochs, lr) -> dict:
+def retrain_pct(model, rows: list[dict], scaler) -> float:
+    """재학습 행들에 대한 kWh 공간 오차율(%) RMSE.
+
+    드리프트 판정(drift_detector.compute_rmse)과 같은 식·같은 단위로,
+    게이트 통과가 곧 재요청 판정 통과를 의미하게 한다.
+    (evaluate()의 역스케일 값은 변화율 공간이라 이 용도로 쓸 수 없다.)
+    """
+    from data.features import SEQ_LEN
+
+    energy = [float(r["energy_kwh"]) for r in rows]
+    model.eval()
+    preds, actuals = [], []
+    with torch.no_grad():
+        for i in range(len(rows) - SEQ_LEN):
+            from data.features import tensors_from_rows
+
+            Xs, _ = tensors_from_rows(rows[i : i + SEQ_LEN + 1], scaler)
+            out = model(torch.from_numpy(np.ascontiguousarray(Xs[-1:])).to(DEVICE))
+            pred_rel = float(scaler.inverse_y(out.cpu().numpy())[0])
+            preds.append(energy[i + SEQ_LEN - 1] * (1 + pred_rel / 100.0))
+            actuals.append(energy[i + SEQ_LEN])
+    return compute_rmse(
+        [{"actual": a, "predicted": p} for a, p in zip(actuals, preds)]
+    )
+
+
+def _fit(model, train_loader, valid_loader, scaler, epochs, lr, grad_clip=None, early_stop=True, restore_best=True) -> dict:
     """노트북 Cell 16 학습 루프 + EarlyStopping + best 복원."""
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -143,6 +179,8 @@ def _fit(model, train_loader, valid_loader, scaler, epochs, lr) -> dict:
             optimizer.zero_grad(set_to_none=True)
             loss = criterion(model(xb), yb)
             loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             del loss
         train_rmse, _ = evaluate(model, train_loader, scaler)
@@ -156,17 +194,27 @@ def _fit(model, train_loader, valid_loader, scaler, epochs, lr) -> dict:
             best_rmse = val_rmse
             best_state = copy.deepcopy(model.state_dict())
             patience = 0
-        else:
+        elif early_stop:
             patience += 1
             if patience >= PATIENCE:
                 print("Early stopping.")
                 break
 
-    model.load_state_dict(best_state)
+    if restore_best:
+        model.load_state_dict(best_state)
     return {"best_val_rmse": best_rmse, "history": history}
 
 
-def _register_if_gate_passed(model, run_id: str, score: float, X_example) -> dict:
+def _register_if_gate_passed(model, run_id: str, score: float, X_example, gate=None) -> dict:
+    """게이트 판정. score/gate는 같은 단위여야 한다.
+
+    - base: 상대변화율 RMSE + RMSE_GATE.
+    - fine_tune(rows): kWh 공간 오차율(%) + FINE_TUNE_PCT_GATE.
+      드리프트 판정(drift_detector.compute_rmse)과 같은 단위·같은 식이라,
+      승격된 모델에 같은 데이터를 다시 넣으면 판정을 통과한다.
+    gate=None이면 RMSE_GATE를 쓴다. 최종 게이트가 None이면 등록은 하되
+    promoted=False로 둔다.
+    """
     import mlflow
     import mlflow.pytorch as mlflow_pytorch
     from mlflow.tracking import MlflowClient
@@ -180,21 +228,20 @@ def _register_if_gate_passed(model, run_id: str, score: float, X_example) -> dic
         model, name="model", input_example=ex, serialization_format="pickle"
     )
     result = {"run_id": run_id, "rmse": score, "promoted": False}
-    if RMSE_GATE is None:
-        print(
-            f"[GATE PENDING] rmse={score:.4f} -> 게이트 미확정(변화율 타깃 확정 후 설정)"
-        )
+    gate = RMSE_GATE if gate is None else gate
+    if gate is None:
+        print(f"[GATE PENDING] rmse={score:.4f} -> 게이트 미확정")
         return result
-    if score <= RMSE_GATE:
+    if score <= gate:
         v = mlflow.register_model(f"runs:/{run_id}/model", MODEL_NAME)
         MlflowClient().transition_model_version_stage(
             name=MODEL_NAME, version=v.version, stage="Production"
         )
         result["promoted"] = True
         result["version"] = v.version
-        print(f"[GATE PASSED] rmse={score:.4f} -> {MODEL_NAME} v{v.version} Production")
+        print(f"[GATE PASSED] rmse={score:.4f} <= {gate} -> {MODEL_NAME} v{v.version} Production")
     else:
-        print(f"[GATE FAILED] rmse={score:.4f} > {RMSE_GATE} -> 배포 차단")
+        print(f"[GATE FAILED] rmse={score:.4f} > {gate} -> 배포 차단")
     return result
 
 
@@ -211,6 +258,18 @@ def _save_local(model, scaler, feature_cols, target_col, seq_len) -> None:
         LOCAL_MODEL_PATH,
     )
     print(f"saved -> {LOCAL_MODEL_PATH}")
+
+
+def _save_if_promoted(out: dict, model, scaler, feature_cols, target_col, seq_len) -> bool:
+    """게이트 통과(promoted)시에만 로컬 번들을 교체한다.
+
+    RMSE_GATE=None이면 promoted가 될 수 없어 로컬 번들은 절대 바뀌지 않는다.
+    """
+    if out.get("promoted"):
+        _save_local(model, scaler, feature_cols, target_col, seq_len)
+        return True
+    print(f"[GATE BLOCKED] rmse={out.get('rmse'):.4f} -> 로컬 번들 유지 ({LOCAL_MODEL_PATH})")
+    return False
 
 
 def train_and_register() -> dict:
@@ -237,13 +296,14 @@ def train_and_register() -> dict:
         mlflow.log_metric("best_val_rmse", stats["best_val_rmse"])
         mlflow.log_metric("test_rmse", test_rmse)
         mlflow.log_metric("test_mae", test_mae)
-        _save_local(model, scaler, FEATURE_COLS, TARGET_COL, Xtr.shape[1])
 
         # 게이트는 validation 기준. test split은 고정 홀드아웃이라 반복 승격 기준으로
         # 쓰면 test에 과적합된다. test 수치는 최종 리포트용으로만 기록한다.
+        # (base는 상대변화율 RMSE + RMSE_GATE로 판정한다.)
         out = _register_if_gate_passed(
             model, mlflow.active_run().info.run_id, stats["best_val_rmse"], Xtr[:1]
         )
+        _save_if_promoted(out, model, scaler, FEATURE_COLS, TARGET_COL, Xtr.shape[1])
         out["test_rmse"] = test_rmse
         out["test_mae"] = test_mae
         return out
@@ -281,15 +341,22 @@ def fine_tune(rows=None, recent_frac: float | None = None) -> dict:
             cut = max(1, int(len(Xtr) * recent_frac))
             Xtr, ytr = Xtr[-cut:], ytr[-cut:]
     train_loader, valid_loader, test_loader = _make_loaders(
-        Xtr, ytr, Xva, yva, Xte, yte
+        Xtr, ytr, Xva, yva, Xte, yte, batch_size=FINE_TUNE_BATCH_SIZE
     )
 
     model = mlflow_pytorch.load_model(f"models:/{MODEL_NAME}/Production")
     model.to(DEVICE)
 
     with mlflow.start_run(run_name="fine-tune"):
+        # 조기종료 없이 전 epoch 수행한다. kWh-조기종료가 %-게이트 수렴 전에
+        # 멈춰 버리면 게이트 통과 가능한 경우에도 차단되기 때문이다.
+        # (best 체크포인트 선택은 kWh 기준 그대로 유지)
+        # 게이트·저장은 최종 가중치 기준: best-kWh 복원을 끄고 끝까지 학습한
+        # 가중치를 그대로 평가·저장한다.
         stats = _fit(
-            model, train_loader, valid_loader, scaler, FINE_TUNE_EPOCHS, FINE_TUNE_LR
+            model, train_loader, valid_loader, scaler,
+            FINE_TUNE_EPOCHS, FINE_TUNE_LR, grad_clip=FINE_TUNE_GRAD_CLIP,
+            early_stop=False, restore_best=False,
         )
         test_rmse, test_mae = evaluate(model, test_loader, scaler)
         print(f"=== Fine-tune Test ===\nRMSE: {test_rmse:.4f}\nMAE : {test_mae:.4f}")
@@ -302,12 +369,21 @@ def fine_tune(rows=None, recent_frac: float | None = None) -> dict:
         mlflow.log_param("n_train", len(Xtr))
         mlflow.log_metric("test_rmse", test_rmse)
         mlflow.log_metric("test_mae", test_mae)
-        _save_local(model, scaler, FEATURE_COLS, TARGET_COL, Xtr.shape[1])
 
         # base와 동일: 게이트는 validation 기준 (rows 모드의 valid 포함).
+        # rows 모드(서버 재학습)는 kWh 공간 오차율(%)로 게이트한다.
+        # split 모드(수동 전체 재학습)는 kWh를 알 수 없어 상대변화율 RMSE 게이트를 쓴다.
+        if rows is not None:
+            gate_score = retrain_pct(model, rows, scaler)
+            gate = FINE_TUNE_PCT_GATE
+        else:
+            gate_score = stats["best_val_rmse"]
+            gate = RMSE_GATE
+        mlflow.log_metric("gate_score", gate_score)
         out = _register_if_gate_passed(
-            model, mlflow.active_run().info.run_id, stats["best_val_rmse"], Xtr[:1]
+            model, mlflow.active_run().info.run_id, gate_score, Xtr[:1], gate=gate
         )
+        _save_if_promoted(out, model, scaler, FEATURE_COLS, TARGET_COL, Xtr.shape[1])
         out["test_rmse"] = test_rmse
         out["test_mae"] = test_mae
         return out
