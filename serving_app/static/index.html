@@ -192,6 +192,17 @@
   }
   .result.show { display: block; }
   .result.error { border-color: var(--alert-strong); color: var(--alert); }
+  .chart { margin-top: 12px; }
+  .chart svg { width: 100%; height: auto; display: block; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; }
+  .chart .cl-axis { stroke: var(--line-strong); stroke-width: 1; }
+  .chart .cl-grid { stroke: var(--line); stroke-width: 1; }
+  .chart .cl-actual { fill: none; stroke: var(--text); stroke-width: 2; stroke-linejoin: round; }
+  .chart .cl-pred { fill: none; stroke: var(--alert); stroke-width: 2; stroke-dasharray: 5 3; }
+  .chart .cl-dot { fill: var(--alert); }
+  .chart .cl-thresh { stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 2 4; }
+  .chart .cl-label { fill: var(--muted); font-size: 11px; }
+  .chart .cl-hint { fill: var(--muted); font-size: 13px; }
+  .readout.skel .ro-value, .readout.skel .ro-meta { color: var(--muted); }
   .readout {
     display: none; margin-top: 12px; padding: 12px 14px; border-radius: 6px;
     background: var(--text); color: var(--ink);
@@ -353,6 +364,7 @@
             <label class="check"><input type="checkbox" id="peak-sound" checked> 경보음</label>
           </div>
           <div class="readout" id="predict-readout"></div>
+          <div class="chart" id="predict-chart"></div>
           <div class="result" id="predict-result"></div>
         </div>
 
@@ -361,14 +373,14 @@
           <div class="panel-head">
             <div>
               <h2><svg class="ico"><use href="#i-detect"/></svg>배치 주입</h2>
-              <p>최근 업로드의 실제 측정값으로 정상 배치 · 드리프트 배치(사용량 노이즈) 생성 후 <code>/predict/batch-test</code> 전송</p>
+              <p>데이터 탭에서 업로드한 파일의 마지막 구간으로 배치 전송 후 <code>/predict/batch-test</code> 전송</p>
             </div>
           </div>
           <div class="btn-row" style="margin-top:0">
-            <button class="btn primary" id="btn-normal" onclick="sendBatch('normal')"><svg><use href="#i-play"/></svg>정상 배치 전송</button>
-            <button class="btn danger" id="btn-drift" onclick="sendBatch('drift')"><svg><use href="#i-warn"/></svg>드리프트 배치 전송</button>
+            <button class="btn primary" id="btn-batch" onclick="sendUploadedBatch()"><svg><use href="#i-play"/></svg>업로드 데이터로 배치 전송</button>
           </div>
           <div class="status-line" id="drift-status"></div>
+          <div class="chart" id="batch-chart"></div>
           <div class="result" id="drift-result"></div>
         </div>
 
@@ -643,6 +655,92 @@ function sparkline(values) {
   const stepX = w / (values.length - 1);
   const pts = values.map((v, i) => `${(i * stepX).toFixed(1)},${(h - ((v - min) / range) * (h - 4) - 2).toFixed(1)}`).join(" ");
   return `<svg class="kpi-spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
+/* 꺾은선 차트. series: [{values, cls, off}] (같은 스케일, off=x 시작 오프셋), thresh: 피크 기준선 */
+function lineChart(series, predIdx = -1, thresh = null) {
+  const w = 560, h = 180, padL = 52, padR = 12, padT = 10, padB = 22;
+  const all = series.flatMap((s) => s.values).filter(Number.isFinite);
+  if (all.length < 2) return "";
+  const max = Math.max(...all), min = Math.min(...all);
+  const span = (max - min) || 1;
+  const lo = min - span * 0.08, hi = max + span * 0.08;
+  const n = Math.max(...series.map((s) => (s.off || 0) + s.values.length));
+  const X = (i) => padL + (n < 2 ? 0 : (i / (n - 1)) * (w - padL - padR));
+  const Y = (v) => padT + (1 - (v - lo) / (hi - lo)) * (h - padT - padB);
+  const lines = series.map((s) => {
+    const off = s.off || 0;
+    const pts = s.values.map((v, i) => `${X(off + i).toFixed(1)},${Y(v).toFixed(1)}`).join(" ");
+    return `<polyline class="${s.cls}" points="${pts}"/>`;
+  }).join("");
+  let dot = "";
+  if (predIdx >= 0 && predIdx < n) {
+    const lastVals = series[series.length - 1].values;
+    dot = `<circle class="cl-dot" cx="${X(predIdx).toFixed(1)}" cy="${Y(lastVals[lastVals.length - 1]).toFixed(1)}" r="4"/>`;
+  }
+  let threshSvg = "";
+  if (Number.isFinite(thresh)) {
+    if (thresh >= lo && thresh <= hi) {
+      const y = Y(thresh).toFixed(1);
+      threshSvg = `<line class="cl-thresh" x1="${padL}" y1="${y}" x2="${w - padR}" y2="${y}"/>`
+        + `<text class="cl-label" x="${w - padR}" y="${(+y - 4).toFixed(1)}" text-anchor="end">기준 ${esc(fmtNum(thresh, 0))}</text>`;
+    } else {
+      const above = thresh > hi;
+      const y = above ? padT + 2 : h - padB - 2;
+      threshSvg = `<text class="cl-label" x="${w - padR}" y="${y + (above ? 10 : -2)}" text-anchor="end">기준 ${esc(fmtNum(thresh, 0))} ${above ? "↑" : "↓"}</text>`;
+    }
+  }
+  return `<svg viewBox="0 0 ${w} ${h}" role="img">`
+    + `<line class="cl-axis" x1="${padL}" y1="${padT}" x2="${padL}" y2="${h - padB}"/>`
+    + `<line class="cl-axis" x1="${padL}" y1="${h - padB}" x2="${w - padR}" y2="${h - padB}"/>`
+    + `<text class="cl-label" x="4" y="${(padT + 10).toFixed(1)}">${esc(fmtNum(hi, 0))}</text>`
+    + `<text class="cl-label" x="4" y="${(h - padB).toFixed(1)}">${esc(fmtNum(lo, 0))}</text>`
+    + lines + threshSvg + dot + `</svg>`;
+}
+/* 빈 차트 스켈레톤 (실행 전 자리 표시) */
+function skeletonChart(hint) {
+  const w = 560, h = 180, padL = 52, padR = 12, padT = 10, padB = 22;
+  return `<svg viewBox="0 0 ${w} ${h}" role="img">`
+    + `<line class="cl-axis" x1="${padL}" y1="${padT}" x2="${padL}" y2="${h - padB}"/>`
+    + `<line class="cl-axis" x1="${padL}" y1="${h - padB}" x2="${w - padR}" y2="${h - padB}"/>`
+    + `<text class="cl-hint" x="${((w + padL) / 2).toFixed(1)}" y="${(h / 2).toFixed(1)}" text-anchor="middle">${esc(hint)}</text></svg>`;
+}
+function renderPredictChart(sequence, predicted) {
+  const box = document.getElementById("predict-chart");
+  const vals = (sequence || []).map((p) => Number(p[cfg.target()])).filter(Number.isFinite);
+  const pv = Number(predicted);
+  if (!vals.length || !Number.isFinite(pv)) { box.innerHTML = ""; return; }
+  box.innerHTML = lineChart([
+    { values: vals, cls: "cl-actual" },
+    { values: [vals[vals.length - 1], pv], cls: "cl-pred", off: vals.length - 1 },
+  ], vals.length, cfg.peakThreshold());
+}
+function renderBatchChart(actual, predicted) {
+  const box = document.getElementById("batch-chart");
+  const a = (actual || []).map(Number).filter(Number.isFinite);
+  const p = (predicted || []).map(Number).filter(Number.isFinite);
+  if (!a.length || a.length !== p.length) { box.innerHTML = ""; return; }
+  box.innerHTML = lineChart([{ values: a, cls: "cl-actual" }, { values: p, cls: "cl-pred" }], -1, cfg.peakThreshold());
+}
+/* 실행 전 스켈레톤: 사용량·경보 기준·예측 사용량·그래프 자리 표시 */
+function renderPredictSkeleton() {
+  const box = document.getElementById("predict-readout");
+  const threshold = cfg.peakThreshold();
+  box.className = "readout show skel";
+  box.dataset.skel = "1";
+  box.innerHTML = `
+    <div class="ro-label">다음 1시간 예측 사용량</div>
+    <div class="ro-value">-</div>
+    <div class="ro-meta">
+      <span>모델 -</span>
+      ${threshold != null ? `<span>피크 기준 ${fmtKwh(threshold, 1)}</span>` : ""}
+    </div>`;
+  document.getElementById("predict-chart").innerHTML = skeletonChart("예측 실행 시 그래프 표시");
+  document.getElementById("batch-chart").innerHTML = skeletonChart("배치 전송 시 그래프 표시");
+}
+function clearPredictSkeleton() {
+  const box = document.getElementById("predict-readout");
+  box.className = "readout";
+  delete box.dataset.skel;
 }
 function fmtTime(ts) {
   if (!ts) return "-";
@@ -928,6 +1026,7 @@ function predictedValue(data) {
 }
 function renderReadout(data) {
   const box = document.getElementById("predict-readout");
+  delete box.dataset.skel;
   const value = predictedValue(data);
   const threshold = cfg.peakThreshold();
   const peak = data[FIELD.peakAlert] != null ? !!data[FIELD.peakAlert] : (value != null && threshold != null && value >= threshold);
@@ -987,7 +1086,8 @@ async function runPredict() {
   const input = document.getElementById("predict-input");
   const resultBox = document.getElementById("predict-result");
   const readout = document.getElementById("predict-readout");
-  readout.className = "readout";
+  clearPredictSkeleton();
+  document.getElementById("predict-chart").innerHTML = "";
   let payload;
   try { payload = JSON.parse(input.value); }
   catch (e) { showResult(resultBox, "입력 JSON 형식 오류: " + e.message, true); return; }
@@ -996,59 +1096,65 @@ async function runPredict() {
     const data = await safeJson(res);
     if (!res.ok) { showResult(resultBox, { status: res.status, detail: data }, true); return; }
     renderReadout(data);
+    renderPredictChart(payload[FIELD.sequence], predictedValue(data));
     showResult(resultBox, data, false);
     loadModelCurrent(); loadMetricsSummary(); loadHealth();
   } catch (e) { showResult(resultBox, "요청 실패: " + e.message, true); }
 }
 
 /* ===================== 배치 주입 ===================== */
-async function sendBatch(kind) {
+/* ===================== 배치 주입 (데이터 탭 업로드 파일) ===================== */
+async function sendUploadedBatch() {
   const statusEl = document.getElementById("drift-status");
   const resultBox = document.getElementById("drift-result");
-  const buttons = [document.getElementById("btn-normal"), document.getElementById("btn-drift")];
+  const btn = document.getElementById("btn-batch");
   const seqLen = cfg.seqLen();
   const n = seqLen + cfg.windowSize();
-
-  buttons.forEach((b) => (b.disabled = true));
-  statusEl.innerHTML = badge("muted", `${kind === "drift" ? "드리프트" : "정상"} 배치 전송 중 · 재학습 시 수십 초 소요`, "i-clock");
+  document.getElementById("batch-chart").innerHTML = "";
+  btn.disabled = true;
+  statusEl.innerHTML = badge("muted", "배치 전송 중 · 재학습 시 수십 초 소요", "i-clock");
   try {
-    // 배치 = 최근 업로드의 마지막 n시간 실제 측정값 (드리프트는 서버가 사용량에 노이즈를 섞어 돌려줌)
-    const sample = await getJSON(`${API.sample}?rows=${n}&drift=${kind === "drift"}`);
+    // 배치 = 데이터 탭에서 업로드한 파일의 마지막 n시간 실제 측정값
+    const sample = await getJSON(`${API.sample}?rows=${n}&drift=false`);
     if (!sample.ok || !sample.data) {
-      statusEl.innerHTML = badge("err", "실제 데이터 조회 실패", "i-err");
+      statusEl.innerHTML = badge("err", "실제 데이터 조회 실패 · 데이터 탭에서 CSV를 먼저 업로드하세요.", "i-err");
       showResult(resultBox, { status: sample.status, detail: sample.data }, true);
       return;
     }
-    const sequence = sample.data.sequence;
-    const res = await fetch(API.batch, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ [FIELD.sequence]: sequence }) });
-    const data = await safeJson(res);
-    if (!res.ok) {
-      statusEl.innerHTML = badge("err", `서버 오류 (HTTP ${res.status})`, "i-err");
-      showResult(resultBox, { status: res.status, detail: data }, true);
-      return;
-    }
-    const actual = sequence.slice(seqLen).map((p) => p[cfg.target()]);
-    const clientRmse = rmseOf(actual, data.predictions || []);
-    lastPipelineRun = { driftCheck: data.drift_check || {}, clientRmse, ts: Date.now() / 1000 };
-    if (clientRmse != null) { batchRmseHistory.push(clientRmse); if (batchRmseHistory.length > 12) batchRmseHistory.shift(); }
-    renderPipeline();
-    loadKpis(); loadAlerts(); loadModelCurrent(); loadModelHistory(); loadMetricsSummary(); loadHealth();
-
-    const check = data.drift_check || {};
-    const serverRmse = check.rmse != null ? fmtKwh(check.rmse, 2) : "-";
-    let line;
-    if (check.status === "retrain_triggered" && check.promoted) line = badge("warn", `드리프트 감지 · 재학습 완료 · 새 버전 승격 (재학습 RMSE ${serverRmse})`, "i-warn");
-    else if (check.status === "retrain_triggered" && check.promoted === false) line = badge("err", `드리프트 감지 · 게이트 미통과 · 기존 버전 유지 (재학습 RMSE ${serverRmse})`, "i-err");
-    else if (check.status === "retrain_triggered") line = badge("warn", "드리프트 감지 · 재학습 트리거", "i-warn");
-    else line = badge("muted", "정상", "i-ok");
-    statusEl.innerHTML = `${line}${badge("muted", `배치 RMSE ${clientRmse != null ? fmtPct(clientRmse, 2) : "-"}`)}`;
-    showResult(resultBox, data, false);
+    await postBatch(sample.data.sequence, statusEl, resultBox);
   } catch (e) {
     statusEl.innerHTML = badge("err", "연결 실패", "i-err");
     showResult(resultBox, "요청 실패: " + e.message, true);
   } finally {
-    buttons.forEach((b) => (b.disabled = false));
+    btn.disabled = false;
   }
+}
+async function postBatch(sequence, statusEl, resultBox) {
+  const seqLen = cfg.seqLen();
+  const res = await fetch(API.batch, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ [FIELD.sequence]: sequence }) });
+  const data = await safeJson(res);
+  if (!res.ok) {
+    statusEl.innerHTML = badge("err", `서버 오류 (HTTP ${res.status})`, "i-err");
+    showResult(resultBox, { status: res.status, detail: data }, true);
+    return;
+  }
+  const actual = sequence.slice(seqLen).map((p) => p[cfg.target()]);
+  const clientRmse = rmseOf(actual, data.predictions || []);
+  lastPipelineRun = { driftCheck: data.drift_check || {}, clientRmse, ts: Date.now() / 1000 };
+  if (clientRmse != null) { batchRmseHistory.push(clientRmse); if (batchRmseHistory.length > 12) batchRmseHistory.shift(); }
+  renderPipeline();
+  renderBatchChart(actual, data.predictions || []);
+  loadKpis(); loadAlerts(); loadModelCurrent(); loadModelHistory(); loadMetricsSummary(); loadHealth();
+
+  const check = data.drift_check || {};
+  const serverRmse = check.rmse != null ? fmtKwh(check.rmse, 2) : "-";
+  let line;
+  if (check.status === "retrain_triggered" && check.promoted) line = badge("warn", `드리프트 감지 · 재학습 완료 · 새 버전 승격 (재학습 RMSE ${serverRmse})`, "i-warn");
+  else if (check.status === "retrain_triggered" && check.promoted === false) line = badge("err", `드리프트 감지 · 게이트 미통과 · 기존 버전 유지 (재학습 RMSE ${serverRmse})`, "i-err");
+  else if (check.status === "retrain_triggered") line = badge("warn", "드리프트 감지 · 재학습 트리거", "i-warn");
+  else line = badge("muted", "정상", "i-ok");
+  statusEl.innerHTML = `${line}${badge("muted", `배치 RMSE ${clientRmse != null ? fmtPct(clientRmse, 2) : "-"}`)}`;
+  showResult(resultBox, data, false);
 }
 
 /* ===================== 요청 지표 요약 ===================== */
@@ -1128,6 +1234,10 @@ async function init() {
   renderRangeToolbar();
   await loadSystemInfo();
   document.getElementById("peak-input").value = CONFIG && CONFIG.peak_threshold != null ? CONFIG.peak_threshold : DEFAULTS.peakThreshold;
+  renderPredictSkeleton();
+  document.getElementById("peak-input").addEventListener("input", () => {
+    if (document.getElementById("predict-readout").dataset.skel) renderPredictSkeleton();
+  });
   loadSample();
   renderPipeline();
   loadHealth();
