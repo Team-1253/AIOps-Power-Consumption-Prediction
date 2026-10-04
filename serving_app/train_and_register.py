@@ -14,7 +14,8 @@ Cell 12(DataLoader) / Cell 21(저장)을 PyTorch + MLflow 형태로 이식.
 이 파일은 스케일러를 fit하지 않는다 (스케일러는 노트북 baseline 산출물).
 
 실행 (project/ 루트에서):
-    python serving_app/train_and_register.py
+    python serving_app/train_and_register.py            # notebooks 번들 있으면 train 스킵하고 등록만
+    python serving_app/train_and_register.py --force    # 번들이 있어도 split으로 진짜 학습 강제
 """
 
 import copy
@@ -47,6 +48,8 @@ FINE_TUNE_GRAD_CLIP = 1.0
 
 MODEL_NAME = "GIGA_Energy_LSTM"
 LOCAL_MODEL_PATH = "serving_app/models/factory_energy_lstm.pt"
+NOTEBOOK_BUNDLE = "notebooks/factory_energy_lstm.pt"
+NOTEBOOK_SCALER = "notebooks/scaler.pkl"
 
 # baseline best-val 4.21 기준 배포 게이트 (상대변화율 RMSE, base 전체 학습용).
 # (plain 대입 유지: routers/system.py가 AST 파싱으로 이 상수를 읽는다)
@@ -272,6 +275,95 @@ def _save_if_promoted(out: dict, model, scaler, feature_cols, target_col, seq_le
     return False
 
 
+def _production_exists() -> str | None:
+    """Registry에 Production 버전이 있으면 그 버전을, 없으면 None을 돌려준다."""
+    try:
+        from mlflow.tracking import MlflowClient
+
+        versions = MlflowClient().search_model_versions(f"name='{MODEL_NAME}'")
+    except Exception as e:
+        print(f"[SKIP] Production 조회 실패 ({e}) -> 등록 진행")
+        return None
+    prod = [v for v in versions if v.current_stage == "Production"]
+    if not prod:
+        return None
+    return max(prod, key=lambda v: int(v.version)).version
+
+
+def _load_notebook_bundle():
+    """노트북 baseline 번들 -> (model, scaler, seq_len, feature_order, target).
+
+    노트북 번들 키: model_state_dict/feature_scaler/target_scaler (서빙 번들의
+    scaler 래퍼와 다름). 스케일러는 notebooks/scaler.pkl(EnergyScaler)을 우선
+    쓰고, 없으면 번들 내장 scaler들로 재조립한다. 재학습은 하지 않는다.
+    """
+    from data.features import EnergyScaler
+
+    bundle = torch.load(NOTEBOOK_BUNDLE, map_location=DEVICE, weights_only=False)
+    seq_len, n_features = bundle["input_shape"]
+    feature_order = bundle.get("feature_order")
+    target = bundle.get("target")
+
+    scaler = None
+    if os.path.isfile(NOTEBOOK_SCALER):
+        try:
+            from data.features import load_scaler
+
+            scaler = load_scaler(NOTEBOOK_SCALER)
+        except Exception as e:
+            print(f"[WARN] {NOTEBOOK_SCALER} 로드 실패 ({e}) -> 번들 내장 scaler 사용")
+            scaler = None
+    if scaler is None:
+        scaler = EnergyScaler()
+        scaler.feature_scaler = bundle["feature_scaler"]
+        scaler.target_scaler = bundle["target_scaler"]
+
+    model = build_model(input_size=n_features, device=DEVICE)
+    model.load_state_dict(bundle["model_state_dict"])
+    model.to(DEVICE).eval()
+    return model, scaler, seq_len, feature_order, target
+
+
+def register_notebook_bundle() -> dict:
+    """노트북 번들이 있으면 train 스킵하고 등록만 한다 (input_example=zeros).
+
+    - 학습/평가/게이트 없이 승격되므로 run에 source/tag를 남긴다.
+    - Production이 이미 있으면 재등록 없이 스킵 (멱등).
+    - 성공 시 서빙 번들 형식으로 _save_local 동기화 (local/mlflow 정합).
+    """
+    import mlflow
+    import mlflow.pytorch as mlflow_pytorch
+    from mlflow.tracking import MlflowClient
+
+    existing = _production_exists()
+    if existing is not None:
+        print(f"[SKIP] {MODEL_NAME} Production v{existing} 이미 존재 -> 등록 스킵")
+        return {"skipped": True, "version": existing, "source": "notebook-bundle"}
+
+    model, scaler, seq_len, feature_order, target = _load_notebook_bundle()
+    dummy = np.zeros((1, seq_len, N_FEATURES), dtype=np.float32)
+
+    with mlflow.start_run(run_name="register-notebook-bundle"):
+        mlflow.log_param("mode", "register-only")
+        mlflow.log_param("source", "notebook-bundle")
+        mlflow.log_param("bundle_path", NOTEBOOK_BUNDLE)
+        mlflow.set_tag("skip_gate", "true")
+        mlflow_pytorch.log_model(
+            model, name="model", input_example=dummy, serialization_format="pickle"
+        )
+        run_id = mlflow.active_run().info.run_id
+        v = mlflow.register_model(f"runs:/{run_id}/model", MODEL_NAME)
+        MlflowClient().transition_model_version_stage(
+            name=MODEL_NAME, version=v.version, stage="Production"
+        )
+        print(f"[REGISTERED] {NOTEBOOK_BUNDLE} -> {MODEL_NAME} v{v.version} Production (train 스킵)")
+        out = {"run_id": run_id, "version": v.version, "promoted": True,
+               "source": "notebook-bundle", "skipped_train": True}
+
+    _save_local(model, scaler, feature_order, target, seq_len)
+    return out
+
+
 def train_and_register() -> dict:
     """처음부터(scratch) 학습. base 학습에서만 사용."""
     import mlflow
@@ -390,4 +482,13 @@ def fine_tune(rows=None, recent_frac: float | None = None) -> dict:
 
 
 if __name__ == "__main__":
-    train_and_register()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="학습 후 등록 (노트북 번들 있으면 train 스킵하고 등록만)")
+    parser.add_argument("--force", action="store_true", help="노트북 번들이 있어도 진짜 학습 강제 실행")
+    args = parser.parse_args()
+
+    if not args.force and os.path.isfile(NOTEBOOK_BUNDLE):
+        register_notebook_bundle()
+    else:
+        train_and_register()
