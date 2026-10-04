@@ -1,6 +1,6 @@
 # AIOps-Power-Consumption-Prediction
 
-AI 데이터센터 전력 수요 예측 서비스 (팀명: 기가(GW) 막힐 땐).
+AI 데이터센터 전력 수요 예측 서비스.
 최근 측정값으로 다음 1시간 전력 사용량(kWh)을 예측하는 LSTM 모델을 FastAPI로 서빙하고,
 드리프트 감지 → fine-tuning 재학습 → MLflow 승격까지 대시보드에서 확인한다.
 
